@@ -93,6 +93,31 @@ def test_base_action_applies_scale_and_offset(fixtures_dir, device):
   assert torch.allclose(action._processed_actions, raw * 2.0 + 0.5)
 
 
+def test_base_action_exposes_processed_action(fixtures_dir, device):
+  """BaseAction.processed_action exposes the transformed action tensor."""
+  entity = make_entity(
+    fixtures_dir / "tendon_finger.xml",
+    ("finger_tendon",),
+    TransmissionType.TENDON,
+    device,
+    from_file=True,
+  )
+  env = make_env(entity, "finger", device)
+
+  cfg = TendonLengthActionCfg(
+    entity_name="finger",
+    actuator_names=("finger_tendon",),
+    scale=2.0,
+    offset=0.5,
+  )
+  action = cfg.build(env)
+
+  raw = torch.tensor([[1.0], [2.0], [3.0], [4.0]], device=device)
+  action.process_actions(raw)
+
+  assert torch.allclose(action.processed_action, raw * 2.0 + 0.5)
+
+
 def test_base_action_reset_zeros_specific_envs(fixtures_dir, device):
   """BaseAction.reset() zeros raw_action for specified env_ids only."""
   entity = make_entity(
