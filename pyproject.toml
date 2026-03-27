@@ -61,6 +61,8 @@ demo = "mjlab.scripts.demo:main"
 list_envs = "mjlab.scripts.list_envs:main"
 viz-nan = "mjlab.scripts.nan_viz:main"
 export-scene = "mjlab.scripts.export_scene:main"
+raw-human-npz-to-keypoints = "mjlab.scripts.raw_human_npz_to_smpl_keypoints:main"
+pyroki-npz-to-csv = "mjlab.scripts.pyroki_npz_to_csv:main"
 
 [dependency-groups]
 dev = [
