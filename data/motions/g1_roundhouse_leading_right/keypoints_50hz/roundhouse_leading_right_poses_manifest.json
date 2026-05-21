@@ -1,0 +1,14 @@
+{
+  "source_path": "/home/ssy/ssy_files/mjlab/data/motions/z2_lite_mocap/roundhouse_leading_right/source/roundhouse_leading_right_poses.npz",
+  "source_fingerprint": {
+    "size": 535928,
+    "mtime_ns": 1778573299270330514
+  },
+  "frame_count": 400,
+  "source_mocap_fps": 120.0,
+  "pose_dimension": 156,
+  "output_fps": 50,
+  "protomotions_root": "/home/ssy/ssy_files/mjlab/.external/ProtoMotions",
+  "generated_keypoint_path": "/home/ssy/ssy_files/mjlab/data/motions/z2_lite_mocap/roundhouse_leading_right/keypoints_50hz/roundhouse_leading_right_poses_keypoints.npy",
+  "generated_intermediate_motion_path": "/home/ssy/ssy_files/mjlab/data/motions/z2_lite_mocap/roundhouse_leading_right/keypoints_50hz/roundhouse_leading_right_poses.motion"
+}

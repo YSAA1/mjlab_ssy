@@ -1,6 +1,7 @@
 """Tests for g1_constants.py."""
 
 import re
+import xml.etree.ElementTree as ET
 
 import mujoco
 import numpy as np
@@ -123,6 +124,25 @@ def test_g1_entity_creation(g1_entity) -> None:
   assert g1_entity.num_joints == 29
   assert g1_entity.is_actuated
   assert not g1_entity.is_fixed_base
+
+
+def test_g1_default_asset_is_mode_15(g1_model) -> None:
+  assert g1_constants.G1_XML.name == "g1.xml"
+  assert g1_constants.G1_URDF.name == "g1_29dof_mode_15.urdf"
+  assert ET.parse(g1_constants.G1_XML).getroot().attrib["model"] == (
+    "g1_29dof_mode_15_aligned"
+  )
+
+
+def test_g1_mode_15_urdf_meshes_exist() -> None:
+  urdf = g1_constants.G1_URDF
+  mesh_files = {
+    mesh.attrib["filename"]
+    for mesh in ET.parse(urdf).getroot().iter("mesh")
+    if "filename" in mesh.attrib
+  }
+  missing = sorted(path for path in mesh_files if not (urdf.parent / path).exists())
+  assert not missing
 
 
 def test_g1_actuators_configured_correctly(g1_model):

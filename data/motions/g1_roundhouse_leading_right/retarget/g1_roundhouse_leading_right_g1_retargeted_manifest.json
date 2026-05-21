@@ -1,0 +1,14 @@
+{
+  "source_path": "/home/ssy/ssy_files/mjlab/.worktrees/g1-flying-kick-main/data/motions/g1_roundhouse_leading_right/keypoints_50hz/roundhouse_leading_right_poses_keypoints.npy",
+  "source_fingerprint": {
+    "size": 179773,
+    "mtime_ns": 1779347029296605207
+  },
+  "generated_output_path": "/home/ssy/ssy_files/mjlab/.worktrees/g1-flying-kick-main/data/motions/g1_roundhouse_leading_right/retarget/g1_roundhouse_leading_right_g1_retargeted.npz",
+  "protomotions_root": "/home/ssy/ssy_files/mjlab/.external/ProtoMotions",
+  "pyroki_python": "/home/ssy/anaconda3/envs/pyroki/bin/python",
+  "source_type": "smpl",
+  "subsample_factor": 1,
+  "target_raw_frames": 500,
+  "input_fps": 50.0
+}

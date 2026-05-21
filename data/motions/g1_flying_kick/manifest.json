@@ -1,0 +1,62 @@
+{
+  "motion_name": "g1_g4_spinning_back_kick",
+  "robot": "unitree_g1",
+  "source_branch": "feature/z2-lite-motion-retarget",
+  "target_branch": "main",
+  "created_at": "2026-05-18",
+  "fps": {
+    "keypoints": 50.0,
+    "retarget": 50.0,
+    "mjlab_motion": 50.0
+  },
+  "retarget_params": {
+    "source_type": "smpl",
+    "subsample_factor": 1,
+    "target_raw_frames": 500,
+    "protomotions_root": "/home/ssy/ssy_files/mjlab/.external/ProtoMotions",
+    "pyroki_python": "/home/ssy/anaconda3/envs/pyroki/bin/python"
+  },
+  "artifacts": {
+    "raw_source": {
+      "path": "data/motions/g1_flying_kick/raw/g4_spinning_back_kick_poses.npz",
+      "sha256": "7ae535ffcd27bef0e3b1cf270fdd0735684c92db4e9bed43e2bbe348878dcb91"
+    },
+    "keypoints_50hz": {
+      "path": "data/motions/g1_flying_kick/keypoints_50hz/g4_spinning_back_kick_poses_keypoints.npy",
+      "shape": {
+        "positions": [165, 18, 3],
+        "orientations": [165, 18, 3, 3],
+        "left_foot_contacts": [165, 2],
+        "right_foot_contacts": [165, 2]
+      },
+      "sha256": "dfba3b6dd50ac0b040aca19053d44eba50d1295107ec688d27ac4dcba04f918b"
+    },
+    "g1_retarget_npz": {
+      "path": "data/motions/g1_flying_kick/retarget/g1_g4_spinning_back_kick_g1_retargeted.npz",
+      "shape": {
+        "base_frame_pos": [165, 3],
+        "base_frame_wxyz": [165, 4],
+        "joint_angles": [165, 29]
+      },
+      "sha256": "229bb7da80ee5415d275ce2cd23e32024bde7c515bdb153a00518b221ab56ae1"
+    },
+    "mjlab_csv": {
+      "path": "data/motions/g1_flying_kick/mjlab/g1_g4_spinning_back_kick.csv",
+      "sha256": "8bbc20f5f7a71c4374ed2a6d539988aa26e3a77a3703cde14a7cd27bf1030999"
+    },
+    "mjlab_motion_npz": {
+      "path": "data/motions/g1_flying_kick/mjlab/motion.npz",
+      "shape": {
+        "joint_pos": [164, 29],
+        "joint_vel": [164, 29],
+        "body_pos_w": [164, 30, 3],
+        "body_quat_w": [164, 30, 4]
+      },
+      "sha256": "ea9e816200133f2561dc12c0e10d43e6e9fe3462492030f07cc3a5ac5330a014"
+    }
+  },
+  "notes": [
+    "Raw source lacks legacy AMASS keys `poses` and `mocap_framerate`; keypoints_50hz is kept as a promoted reproducible input.",
+    "Training should pass `--env.commands.motion.motion-file data/motions/g1_flying_kick/mjlab/motion.npz` to a G1 tracking task, preferably a specialized task variant if training defaults need to differ from baseline."
+  ]
+}

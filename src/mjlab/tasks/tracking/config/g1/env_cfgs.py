@@ -124,10 +124,14 @@ def unitree_g1_flat_crouch_to_lie_down_env_cfg(
 
 
 def unitree_g1_flat_acrobatics_env_cfg(
+  has_state_estimation: bool = True,
   play: bool = False,
 ) -> ManagerBasedRlEnvCfg:
   """Create a G1 tracking config specialized for high-dynamic acrobatic motions."""
-  cfg = unitree_g1_flat_tracking_env_cfg(play=play)
+  cfg = unitree_g1_flat_tracking_env_cfg(
+    has_state_estimation=has_state_estimation,
+    play=play,
+  )
 
   motion_cmd = cfg.commands["motion"]
   assert isinstance(motion_cmd, MotionCommandCfg)

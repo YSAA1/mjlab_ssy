@@ -150,7 +150,7 @@ def _run_rsl_rl_play(task_id: str, cfg: PlayConfig):
   resume_path: Path | None = None
   checkpoint_parity = None
   if TRAINED_MODE:
-    log_root_path = (Path("logs") / "rsl_rl" / agent_cfg.experiment_name).resolve()
+    log_root_path = (Path("logs") / "rsl_rl" / agent_cfg["experiment_name"]).resolve()
     if cfg.checkpoint_file is not None:
       resume_path = Path(cfg.checkpoint_file)
       if not resume_path.exists():

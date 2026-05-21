@@ -50,26 +50,30 @@ def test_tracking_tasks_have_self_collision_sensor(
 
 def test_tracking_no_state_estimation_observations() -> None:
   """No-state-estimation tasks remove observations that depend on state estimation."""
-  task_id = "Mjlab-Tracking-Flat-Unitree-G1-No-State-Estimation"
+  task_ids = [
+    "Mjlab-Tracking-Flat-Unitree-G1-No-State-Estimation",
+    "Mjlab-Tracking-Flat-Unitree-G1-Acrobatics-No-State-Estimation",
+  ]
 
-  # Test both training and play modes
-  for play_mode in [False, True]:
-    cfg = load_env_cfg(task_id, play=play_mode)
-    mode_str = "play mode" if play_mode else "training mode"
+  for task_id in task_ids:
+    # Test both training and play modes
+    for play_mode in [False, True]:
+      cfg = load_env_cfg(task_id, play=play_mode)
+      mode_str = "play mode" if play_mode else "training mode"
 
-    assert "actor" in cfg.observations, (
-      f"Task {task_id} ({mode_str}) missing policy observations"
-    )
-    actor_terms = cfg.observations["actor"].terms
+      assert "actor" in cfg.observations, (
+        f"Task {task_id} ({mode_str}) missing policy observations"
+      )
+      actor_terms = cfg.observations["actor"].terms
 
-    assert "motion_anchor_pos_b" not in actor_terms, (
-      f"Task {task_id} ({mode_str}) has motion_anchor_pos_b in policy, "
-      "expected it to be removed for no-state-estimation variant"
-    )
-    assert "base_lin_vel" not in actor_terms, (
-      f"Task {task_id} ({mode_str}) has base_lin_vel in policy, "
-      "expected it to be removed for no-state-estimation variant"
-    )
+      assert "motion_anchor_pos_b" not in actor_terms, (
+        f"Task {task_id} ({mode_str}) has motion_anchor_pos_b in policy, "
+        "expected it to be removed for no-state-estimation variant"
+      )
+      assert "base_lin_vel" not in actor_terms, (
+        f"Task {task_id} ({mode_str}) has base_lin_vel in policy, "
+        "expected it to be removed for no-state-estimation variant"
+      )
 
 
 def test_tracking_play_disables_rsi_randomization() -> None:
@@ -77,6 +81,7 @@ def test_tracking_play_disables_rsi_randomization() -> None:
   tracking_tasks = [
     "Mjlab-Tracking-Flat-Unitree-G1",
     "Mjlab-Tracking-Flat-Unitree-G1-No-State-Estimation",
+    "Mjlab-Tracking-Flat-Unitree-G1-Acrobatics-No-State-Estimation",
   ]
 
   for task_id in tracking_tasks:
@@ -102,6 +107,7 @@ def test_tracking_play_uses_start_sampling_mode() -> None:
   tracking_tasks = [
     "Mjlab-Tracking-Flat-Unitree-G1",
     "Mjlab-Tracking-Flat-Unitree-G1-No-State-Estimation",
+    "Mjlab-Tracking-Flat-Unitree-G1-Acrobatics-No-State-Estimation",
   ]
 
   for task_id in tracking_tasks:
@@ -295,6 +301,13 @@ def test_acrobatics_task_is_registered() -> None:
   assert task_id in list_tasks(), f"Task {task_id} is not registered"
 
 
+def test_acrobatics_no_state_estimation_task_is_registered() -> None:
+  """The deploy-friendly acrobatics tracking task should be registered."""
+  task_id = "Mjlab-Tracking-Flat-Unitree-G1-Acrobatics-No-State-Estimation"
+
+  assert task_id in list_tasks(), f"Task {task_id} is not registered"
+
+
 def test_acrobatics_training_cfg_is_relaxed_for_flips() -> None:
   """Acrobatics training should remove disturbances and relax strict terminations."""
   task_id = "Mjlab-Tracking-Flat-Unitree-G1-Acrobatics"
@@ -323,6 +336,17 @@ def test_acrobatics_rl_cfg_targets_long_finetune() -> None:
   cfg = load_rl_cfg(task_id)
 
   assert cfg.experiment_name == "g1_tracking_handstand1"
+  assert cfg.max_iterations == 40_000
+  assert cfg.num_steps_per_env == 32
+  assert cfg.algorithm.learning_rate == 5.0e-4
+
+
+def test_acrobatics_no_state_estimation_rl_cfg_uses_separate_experiment() -> None:
+  """Deploy-friendly acrobatics runs should not write into the baseline experiment."""
+  task_id = "Mjlab-Tracking-Flat-Unitree-G1-Acrobatics-No-State-Estimation"
+  cfg = load_rl_cfg(task_id)
+
+  assert cfg.experiment_name == "g1_tracking_acrobatics_no_state"
   assert cfg.max_iterations == 40_000
   assert cfg.num_steps_per_env == 32
   assert cfg.algorithm.learning_rate == 5.0e-4
