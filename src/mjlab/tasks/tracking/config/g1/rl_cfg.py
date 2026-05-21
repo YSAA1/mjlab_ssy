@@ -66,3 +66,10 @@ def unitree_g1_tracking_acrobatics_finetune_runner_cfg() -> RslRlOnPolicyRunnerC
   cfg.save_interval = 500
   cfg.max_iterations = 40_000
   return cfg
+
+
+def unitree_g1_tracking_acrobatics_no_state_runner_cfg() -> RslRlOnPolicyRunnerCfg:
+  """Create a deploy-friendly acrobatics runner without state-estimation observations."""
+  cfg = unitree_g1_tracking_acrobatics_finetune_runner_cfg()
+  cfg.experiment_name = "g1_tracking_acrobatics_no_state"
+  return cfg

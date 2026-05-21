@@ -1,0 +1,72 @@
+{
+  "motion_name": "g1_roundhouse_leading_right",
+  "robot": "unitree_g1",
+  "source_motion": "roundhouse_leading_right",
+  "created_at": "2026-05-21",
+  "fps": {
+    "raw_mocap": 120.0,
+    "keypoints": 50.0,
+    "retarget": 50.0,
+    "mjlab_motion": 50.0
+  },
+  "retarget_params": {
+    "source_type": "smpl",
+    "subsample_factor": 1,
+    "target_raw_frames": 500,
+    "protomotions_root": "/home/ssy/ssy_files/mjlab/.external/ProtoMotions",
+    "pyroki_python": "/home/ssy/anaconda3/envs/pyroki/bin/python"
+  },
+  "artifacts": {
+    "raw_source": {
+      "path": "data/motions/g1_roundhouse_leading_right/raw/roundhouse_leading_right_poses.npz",
+      "origin_path": "/home/ssy/ssy_files/mjlab/data/motions/z2_lite_mocap/roundhouse_leading_right/source/roundhouse_leading_right_poses.npz",
+      "shape": {
+        "trans": [400, 3],
+        "poses": [400, 156],
+        "betas": [16],
+        "dmpls": [400, 8]
+      },
+      "sha256": "92950a810406fc8a9451e12dabe916b5baeb7e5ac4e574c4d09211f92d1c9fe5"
+    },
+    "keypoints_50hz": {
+      "path": "data/motions/g1_roundhouse_leading_right/keypoints_50hz/roundhouse_leading_right_poses_keypoints.npy",
+      "origin_path": "/home/ssy/ssy_files/mjlab/data/motions/z2_lite_mocap/roundhouse_leading_right/keypoints_50hz/roundhouse_leading_right_poses_keypoints.npy",
+      "shape": {
+        "positions": [200, 18, 3],
+        "orientations": [200, 18, 3, 3],
+        "left_foot_contacts": [200, 2],
+        "right_foot_contacts": [200, 2]
+      },
+      "sha256": "d1f190e4a4c86b4322eafe4b7bde69d4ea0ca4f22319d0e722a9a97f46d95017"
+    },
+    "g1_retarget_npz": {
+      "path": "data/motions/g1_roundhouse_leading_right/retarget/g1_roundhouse_leading_right_g1_retargeted.npz",
+      "shape": {
+        "base_frame_pos": [200, 3],
+        "base_frame_wxyz": [200, 4],
+        "joint_angles": [200, 29]
+      },
+      "sha256": "5cafb41b8a48017056ffa1bf30976ca20ab55fcb952935e4d6d98a5caa193ef4"
+    },
+    "mjlab_csv": {
+      "path": "data/motions/g1_roundhouse_leading_right/mjlab/g1_roundhouse_leading_right.csv",
+      "rows": 200,
+      "columns": 36,
+      "sha256": "920ce49040680eca7bb7770780bd34209df84b98d0dd60762ade226d52b7da04"
+    },
+    "mjlab_motion_npz": {
+      "path": "data/motions/g1_roundhouse_leading_right/mjlab/motion.npz",
+      "shape": {
+        "joint_pos": [199, 29],
+        "joint_vel": [199, 29],
+        "body_pos_w": [199, 30, 3],
+        "body_quat_w": [199, 30, 4]
+      },
+      "sha256": "d3b38da1d55bb630805cc166e792cc81a51222f1e8ecd9ab70c73b3378331c48"
+    }
+  },
+  "notes": [
+    "The existing Z2 retarget output for this motion has 41 joint columns and was not reused for G1 training.",
+    "Training should pass --env.commands.motion.motion-file data/motions/g1_roundhouse_leading_right/mjlab/motion.npz to a G1 tracking task."
+  ]
+}

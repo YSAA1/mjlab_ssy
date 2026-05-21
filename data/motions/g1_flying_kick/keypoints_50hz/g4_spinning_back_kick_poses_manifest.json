@@ -1,0 +1,15 @@
+{
+  "source_path": "/home/ssy/ssy_files/mjlab/.worktrees/g1-flying-kick-main/data/motions/g1_flying_kick/raw/g4_spinning_back_kick_poses.npz",
+  "source_fingerprint": {
+    "size": 204576,
+    "mtime_ns": 1778740303338229268
+  },
+  "frame_count": 329,
+  "source_mocap_fps": 120.0,
+  "pose_dimension": 66,
+  "output_fps": 50,
+  "protomotions_root": "/home/ssy/ssy_files/mjlab/.external/ProtoMotions",
+  "generated_keypoint_path": "/home/ssy/ssy_files/mjlab/.worktrees/g1-flying-kick-main/data/motions/g1_flying_kick/keypoints_50hz/g4_spinning_back_kick_poses_keypoints.npy",
+  "generated_intermediate_motion_path": "/home/ssy/ssy_files/mjlab/.worktrees/g1-flying-kick-main/data/motions/g1_flying_kick/keypoints_50hz/g4_spinning_back_kick_poses.motion",
+  "provenance_note": "Promoted from feature/z2-lite-motion-retarget for G1 flying-kick retargeting."
+}

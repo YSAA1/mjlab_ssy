@@ -21,6 +21,15 @@ G1_XML: Path = (
   MJLAB_SRC_PATH / "asset_zoo" / "robots" / "unitree_g1" / "xmls" / "g1.xml"
 )
 assert G1_XML.exists()
+G1_URDF: Path = (
+  MJLAB_SRC_PATH
+  / "asset_zoo"
+  / "robots"
+  / "unitree_g1"
+  / "urdf"
+  / "g1_29dof_mode_15.urdf"
+)
+assert G1_URDF.exists()
 
 
 def get_spec() -> mujoco.MjSpec:
