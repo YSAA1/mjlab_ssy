@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import cast
 
@@ -80,6 +80,8 @@ class EvaluateConfig:
   """Device to run on. Defaults to CUDA if available."""
   output_file: str | None = None
   """Optional path to save metrics as JSON."""
+  log_root: str = "logs/rsl_rl"
+  """Root directory under which experiment logs are written."""
 
 
 def run_evaluate(task_id: str, cfg: EvaluateConfig) -> dict[str, float]:
@@ -102,7 +104,7 @@ def _resolve_rsl_rl_checkpoint_path(experiment_name: str, cfg: EvaluateConfig) -
       "RSL-RL evaluation requires `wandb_run_path` when `checkpoint_file` is not "
       "provided."
     )
-  log_root_path = (Path("logs") / "rsl_rl" / experiment_name).resolve()
+  log_root_path = (Path(cfg.log_root) / experiment_name).resolve()
   resume_path, _ = get_wandb_checkpoint_path(
     log_root_path, Path(cfg.wandb_run_path), cfg.wandb_checkpoint_name
   )
@@ -170,7 +172,7 @@ def _run_rsl_rl_evaluate(
     )
 
   runner_cls = load_runner_cls(task_id) or MjlabOnPolicyRunner
-  runner = runner_cls(env, agent_cfg, device=device)
+  runner = runner_cls(env, asdict(agent_cfg), device=device)
   runner.load(str(resume_path), map_location=device)
   policy = runner.get_inference_policy(device=device)
 

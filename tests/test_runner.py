@@ -14,7 +14,7 @@ from rsl_rl.models import MLPModel
 from tensordict import TensorDict
 
 import mjlab.scripts.train as train_mod
-from mjlab.actuator import XmlMotorActuatorCfg
+from mjlab.actuator import XmlActuatorCfg
 from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg, mdp
 from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
@@ -33,7 +33,7 @@ def device():
   return get_test_device()
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def env(device):
   robot_xml = """
   <mujoco>
@@ -55,7 +55,7 @@ def env(device):
   robot_cfg = EntityCfg(
     spec_fn=lambda: mujoco.MjSpec.from_string(robot_xml),
     articulation=EntityArticulationInfoCfg(
-      actuators=(XmlMotorActuatorCfg(target_names_expr=(".*",)),)
+      actuators=(XmlActuatorCfg(target_names_expr=(".*",)),)
     ),
   )
 
@@ -372,6 +372,26 @@ def test_cnn_onnx_runtime_roundtrip_matches_pytorch():
     [actual] = sess.run(None, {"obs": x_1d.numpy(), "camera": x_2d.numpy()})
 
   torch.testing.assert_close(torch.from_numpy(actual), expected, atol=1e-5, rtol=0)
+
+
+def test_get_export_paths():
+  """_get_export_paths resolves the correct dir, filename, and full path."""
+  # Normal case: "model" only appears in the checkpoint filename.
+  export_dir, filename, onnx_path = MjlabOnPolicyRunner._get_export_paths(
+    "/logs/2026-03-30_12-00-00/model_10.pt"
+  )
+  assert export_dir == Path("/logs/2026-03-30_12-00-00")
+  assert filename == "2026-03-30_12-00-00.onnx"
+  assert onnx_path == Path("/logs/2026-03-30_12-00-00/2026-03-30_12-00-00.onnx")
+
+  # Bug case: "model" also appears in a parent directory name — the old
+  # path.split("model")[0] would have truncated to "/tmp/my_".
+  export_dir, filename, onnx_path = MjlabOnPolicyRunner._get_export_paths(
+    "/tmp/my_model_experiment/2026-03-30/model_10.pt"
+  )
+  assert export_dir == Path("/tmp/my_model_experiment/2026-03-30")
+  assert filename == "2026-03-30.onnx"
+  assert onnx_path == Path("/tmp/my_model_experiment/2026-03-30/2026-03-30.onnx")
 
 
 def test_agent_cfg_serializable_after_runner_creation(env, device):

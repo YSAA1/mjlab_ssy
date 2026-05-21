@@ -181,7 +181,8 @@ def _make_pd_env(device, num_envs=2):
   builtin.ctrl_ids = torch.tensor([0, 1], device=device)
   builtin.global_ctrl_ids = torch.tensor([0, 1], device=device)
 
-  xml = Mock(spec=actuator.XmlPositionActuator)
+  xml = Mock(spec=actuator.XmlActuator)
+  xml.command_field = "position"
   xml.ctrl_ids = torch.tensor([2, 3], device=device)
   xml.global_ctrl_ids = torch.tensor([2, 3], device=device)
 
@@ -229,7 +230,8 @@ def _make_effort_env(device, num_envs=2):
   builtin.ctrl_ids = torch.tensor([0, 1], device=device)
   builtin.global_ctrl_ids = torch.tensor([0, 1], device=device)
 
-  xml = Mock(spec=actuator.XmlPositionActuator)
+  xml = Mock(spec=actuator.XmlActuator)
+  xml.command_field = "position"
   xml.ctrl_ids = torch.tensor([2, 3], device=device)
   xml.global_ctrl_ids = torch.tensor([2, 3], device=device)
 
@@ -416,6 +418,62 @@ def test_effort_limits_scale_no_accumulation(device):
   assert abs(actual_upper - 200.0) < 1e-5
 
 
+def test_pd_gains_accepts_operation_object(device):
+  """dr.scale / dr.abs Operation objects produce the same result as strings."""
+  env_str, ideal_str = _make_pd_env(device)
+  env_obj, ideal_obj = _make_pd_env(device)
+
+  ids = torch.tensor([0], device=device)
+  kwargs = dict(
+    kp_range=(1.5, 1.5), kd_range=(2.0, 2.0), asset_cfg=SceneEntityCfg("robot")
+  )
+
+  torch.manual_seed(0)
+  dr.pd_gains(env_str, ids, operation="scale", **kwargs)
+  torch.manual_seed(0)
+  dr.pd_gains(env_obj, ids, operation=dr.scale, **kwargs)
+
+  assert torch.allclose(
+    env_str.sim.model.actuator_gainprm[0], env_obj.sim.model.actuator_gainprm[0]
+  )
+  assert torch.allclose(ideal_str.stiffness, ideal_obj.stiffness)
+
+
+def test_effort_limits_accepts_operation_object(device):
+  """dr.abs Operation object produces the same result as the string."""
+  env_str, ideal_str = _make_effort_env(device)
+  env_obj, ideal_obj = _make_effort_env(device)
+
+  ids = torch.tensor([0], device=device)
+  kwargs = dict(effort_limit_range=(150.0, 150.0), asset_cfg=SceneEntityCfg("robot"))
+
+  dr.effort_limits(env_str, ids, operation="abs", **kwargs)
+  dr.effort_limits(env_obj, ids, operation=dr.abs, **kwargs)
+
+  assert torch.allclose(
+    env_str.sim.model.actuator_forcerange[0], env_obj.sim.model.actuator_forcerange[0]
+  )
+  assert torch.allclose(ideal_str.force_limit, ideal_obj.force_limit)
+
+
+def test_pd_gains_rejects_unsupported_operation(device):
+  """Operations other than scale/abs raise ValueError."""
+  env, _ = _make_pd_env(device)
+  ids = torch.tensor([0], device=device)
+
+  with pytest.raises(ValueError, match="only supports 'scale' and 'abs'"):
+    dr.pd_gains(env, ids, kp_range=(1.0, 1.0), kd_range=(1.0, 1.0), operation=dr.add)
+
+
+def test_effort_limits_rejects_unsupported_operation(device):
+  """Operations other than scale/abs raise ValueError."""
+  env, _ = _make_effort_env(device)
+  ids = torch.tensor([0], device=device)
+
+  with pytest.raises(ValueError, match="only supports 'scale' and 'abs'"):
+    dr.effort_limits(env, ids, effort_limit_range=(1.0, 1.0), operation=dr.add)
+
+
 # ===========================================================================
 # Section 3: Other events
 # ===========================================================================
@@ -468,44 +526,6 @@ def test_reset_joints_by_offset(device):
   assert torch.allclose(joint_pos, torch.ones_like(joint_pos) * 0.5)
 
 
-def test_sync_actuator_delays(device):
-  """Samples lag in range and applies to all delayed actuators."""
-  from mjlab.actuator.delayed_actuator import DelayedActuator
-
-  env = Mock()
-  env.num_envs = 4
-  env.device = device
-
-  delayed_1 = Mock(spec=DelayedActuator)
-  delayed_2 = Mock(spec=DelayedActuator)
-  non_delayed = Mock(spec=actuator.BuiltinPositionActuator)
-
-  mock_entity = Mock()
-  mock_entity.actuators = [delayed_1, non_delayed, delayed_2]
-  env.scene = {"robot": mock_entity}
-
-  torch.manual_seed(42)
-  dr.sync_actuator_delays(
-    env,
-    env_ids=None,
-    lag_range=(1, 5),
-    asset_cfg=SceneEntityCfg("robot"),
-  )
-
-  delayed_1.set_lags.assert_called_once()
-  delayed_2.set_lags.assert_called_once()
-  assert not hasattr(non_delayed, "set_lags")
-
-  # Both calls should receive the same lags (same sample).
-  lags_1 = delayed_1.set_lags.call_args[0][0]
-  lags_2 = delayed_2.set_lags.call_args[0][0]
-  torch.testing.assert_close(lags_1, lags_2)
-
-  assert torch.all(lags_1 >= 1)
-  assert torch.all(lags_1 <= 5)
-  assert len(lags_1) == 4
-
-
 # ===========================================================================
 # Section 4: Step mode and apply_body_impulse
 # ===========================================================================
@@ -539,7 +559,9 @@ def test_step_mode_fires_every_call(device):
   assert call_count[0] == 5
 
 
-def _make_impulse_env(device, num_envs=2, num_bodies=1, body_ids=None):
+def _make_impulse_env(
+  device, num_envs=2, num_bodies=1, body_ids=None, cooldown_s=(0.0, 0.0)
+):
   """Create a mock env for apply_body_impulse tests."""
   if body_ids is None:
     body_ids = [0]
@@ -559,7 +581,7 @@ def _make_impulse_env(device, num_envs=2, num_bodies=1, body_ids=None):
 
   asset_cfg = SceneEntityCfg("robot", body_ids=body_ids)
   term_cfg = Mock()
-  term_cfg.params = {"asset_cfg": asset_cfg}
+  term_cfg.params = {"asset_cfg": asset_cfg, "cooldown_s": cooldown_s}
   impulse = events.apply_body_impulse(cfg=term_cfg, env=env)
   return env, mock_entity, asset_cfg, impulse
 
@@ -567,11 +589,13 @@ def _make_impulse_env(device, num_envs=2, num_bodies=1, body_ids=None):
 def test_apply_body_impulse_basic(device):
   """Impulse is applied and cleared after duration expires."""
   env, mock_entity, asset_cfg, impulse = _make_impulse_env(
-    device, num_envs=2, num_bodies=3, body_ids=[1]
+    device, num_envs=2, num_bodies=3, body_ids=[1], cooldown_s=(10.0, 10.0)
   )
 
-  # First call: cooldown_s starts at 0 and gets decremented by dt,
-  # so it becomes <= 0 and triggers.
+  # Skip the initial cooldown so the first call triggers immediately;
+  # the trigger/sustain/expire cycle is what's under test here.
+  impulse._interval_time_left[:] = 0.0
+
   impulse(
     env,
     None,
@@ -677,6 +701,43 @@ def test_apply_body_impulse_reset_clears(device):
   env_ids_arg = call_args[1]["env_ids"]
   assert len(env_ids_arg) == 1
   assert env_ids_arg[0].item() == 0
+
+
+def test_apply_body_impulse_initial_cooldown(device):
+  """The first call after init/reset enters cooldown, not an immediate impulse.
+
+  Regression test for #973.
+  """
+  env, mock_entity, asset_cfg, impulse = _make_impulse_env(
+    device, num_envs=1, num_bodies=1, body_ids=[0], cooldown_s=(0.05, 0.05)
+  )
+
+  def step():
+    impulse(
+      env,
+      None,
+      force_range=(10.0, 10.0),
+      torque_range=(0.0, 0.0),
+      duration_s=(1.0, 1.0),
+      cooldown_s=(0.05, 0.05),  # ~2.5 steps at dt=0.02
+      asset_cfg=asset_cfg,
+    )
+
+  # First two steps consume the sampled cooldown; impulse must not fire yet.
+  step()
+  assert not impulse._active.any()
+  step()
+  assert not impulse._active.any()
+
+  # Third step crosses the cooldown boundary and triggers.
+  step()
+  assert impulse._active.all()
+
+  # Reset re-enters cooldown: next step should not immediately re-trigger.
+  impulse.reset(env_ids=torch.tensor([0], device=device))
+  assert not impulse._active.any()
+  step()
+  assert not impulse._active.any()
 
 
 # ===========================================================================

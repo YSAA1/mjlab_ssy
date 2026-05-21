@@ -1,276 +1,802 @@
-"""Manages all Viser visualization handles and state for MuJoCo models."""
+"""Bridge between mjviser's ViserMujocoScene and mjlab's DebugVisualizer."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any, cast
 
 import mujoco
 import numpy as np
 import torch
 import trimesh
-import trimesh.visual
 import viser
 import viser.transforms as vtf
-from mujoco import mj_id2name, mjtGeom, mjtObj
-from typing_extensions import override
-
-from mjlab.viewer.debug_visualizer import DebugVisualizer
-from mjlab.viewer.viser.conversions import (
+from mjviser import ViserMujocoScene
+from mjviser.conversions import (
   create_primitive_mesh,
   get_body_name,
   group_geoms_by_visual_compat,
   is_fixed_body,
   merge_geoms,
-  merge_sites,
   mujoco_mesh_to_trimesh,
-  rotation_matrix_from_vectors,
-  rotation_quat_from_vectors,
+)
+from mujoco import mjtGeom
+from typing_extensions import override
+
+from mjlab.viewer.debug_visualizer import DebugVisualizer
+from mjlab.viewer.model_sync import (
+  VIEWER_MODEL_FIELDS,
+  disable_model_sameframe_shortcuts,
+  sync_model_fields,
 )
 
-try:
-  import mujoco_warp as mjwarp
-except ImportError:
-  mjwarp = None  # type: ignore
+_Z_AXIS = np.array([0.0, 0.0, 1.0])
+_IDENTITY_QUAT = np.array([1.0, 0.0, 0.0, 0.0])
+_VISER_GEOMETRY_HANDLE_FIELDS = frozenset(
+  {
+    "geom_dataid",
+    "geom_size",
+    "geom_pos",
+    "geom_quat",
+  }
+)
+_VISER_APPEARANCE_HANDLE_FIELDS = frozenset(
+  {
+    "geom_rgba",
+    "mat_rgba",
+  }
+)
+_VISER_BAKED_HANDLE_FIELDS = (
+  _VISER_GEOMETRY_HANDLE_FIELDS | _VISER_APPEARANCE_HANDLE_FIELDS
+)
 
 
-# Viser visualization defaults.
-_DEFAULT_FOV_DEGREES = 60
-_DEFAULT_FOV_MIN = 20
-_DEFAULT_FOV_MAX = 150
-_DEFAULT_ENVIRONMENT_INTENSITY = 0.8
-_DEFAULT_CONTACT_POINT_COLOR = (230, 153, 51)
-_DEFAULT_CONTACT_FORCE_COLOR = (255, 0, 0)
+def _rotation_quat(from_vec: np.ndarray, to_vec: np.ndarray) -> np.ndarray:
+  """Quaternion (wxyz) that rotates ``from_vec`` to ``to_vec``."""
+  from_vec = from_vec / np.linalg.norm(from_vec)
+  to_vec = to_vec / np.linalg.norm(to_vec)
+  if np.allclose(from_vec, to_vec):
+    return _IDENTITY_QUAT.copy()
+  if np.allclose(from_vec, -to_vec):
+    perp = np.array([1.0, 0.0, 0.0])
+    if abs(from_vec[0]) > 0.9:
+      perp = np.array([0.0, 1.0, 0.0])
+    axis = np.cross(from_vec, perp)
+    axis = axis / np.linalg.norm(axis)
+    return np.array([0.0, axis[0], axis[1], axis[2]])
+  cross = np.cross(from_vec, to_vec)
+  dot = np.dot(from_vec, to_vec)
+  quat = np.array([1.0 + dot, cross[0], cross[1], cross[2]])
+  return quat / np.linalg.norm(quat)
+
+
+def _to_numpy(x: np.ndarray | torch.Tensor) -> np.ndarray:
+  if isinstance(x, torch.Tensor):
+    return x.cpu().numpy()
+  return x
+
+
+def _color_uint8(rgba: tuple[float, float, float, float]) -> np.ndarray:
+  return (np.array(rgba[:3]) * 255).astype(np.uint8)
+
+
+# Batched primitive handle.
 
 
 @dataclass
-class _Contact:
-  """Contact data from MuJoCo."""
+class _BatchedPrimitive:
+  """Manages a single batched mesh handle with lazy mesh creation."""
 
-  pos: np.ndarray
-  frame: np.ndarray  # 3x3 rotation matrix.
-  force: np.ndarray  # Force in contact frame.
-  dist: float
-  included: bool
+  name: str
+  mesh_factory: Callable[[], trimesh.Trimesh]
+  mesh: trimesh.Trimesh | None = field(default=None, repr=False)
+  handle: viser.BatchedMeshHandle | None = field(default=None, repr=False)
+
+  def remove(self) -> None:
+    if self.handle is not None:
+      self.handle.remove()
+      self.handle = None
+
+  def sync(
+    self,
+    server: viser.ViserServer,
+    env_idx: int,
+    positions: np.ndarray,
+    wxyzs: np.ndarray,
+    scales: np.ndarray,
+    colors: np.ndarray,
+    opacity: float = 1.0,
+  ) -> None:
+    """Create or update the batched mesh handle."""
+    if self.mesh is None:
+      self.mesh = self.mesh_factory()
+
+    needs_recreation = self.handle is None or len(positions) != len(
+      self.handle.batched_positions
+    )
+    if needs_recreation:
+      self.remove()
+      self.handle = server.scene.add_batched_meshes_simple(
+        f"/debug/env_{env_idx}/{self.name}",
+        self.mesh.vertices,
+        self.mesh.faces,
+        batched_wxyzs=wxyzs,
+        batched_positions=positions,
+        batched_scales=scales,
+        batched_colors=colors,
+        opacity=opacity,
+        cast_shadow=False,
+        receive_shadow=False,
+      )
+    else:
+      assert self.handle is not None
+      self.handle.batched_positions = positions
+      self.handle.batched_wxyzs = wxyzs
+      self.handle.batched_scales = scales
+      self.handle.batched_colors = colors
 
 
 @dataclass
-class _ContactPointVisual:
-  """Visual representation data for a contact point."""
-
-  position: np.ndarray
-  orientation: np.ndarray  # Quaternion (wxyz).
-  scale: np.ndarray  # [width, width, height].
-
-
-@dataclass
-class _ContactForceVisual:
-  """Visual representation data for a contact force arrow."""
-
-  shaft_position: np.ndarray
-  shaft_orientation: np.ndarray  # Quaternion (wxyz).
-  shaft_scale: np.ndarray  # [width, width, length].
-  head_position: np.ndarray
-  head_orientation: np.ndarray  # Quaternion (wxyz).
-  head_scale: np.ndarray  # [width, width, width].
+class _PerWorldMeshGroup:
+  handle: viser.BatchedGlbHandle
+  body_ids: np.ndarray
+  group_id: int
+  mocap_ids: np.ndarray | None
+  env_ids: np.ndarray
 
 
 @dataclass
-class ViserMujocoScene(DebugVisualizer):
-  """Manages Viser scene handles and visualization state for MuJoCo models.
+class _VariantMeshGroup:
+  mesh: trimesh.Trimesh
+  group_id: int
+  sub_idx: int
+  body_name: str
+  is_mocap: bool
+  env_ids: list[int] = field(default_factory=list)
+  body_ids: list[int] = field(default_factory=list)
+  mocap_ids: list[int] = field(default_factory=list)
 
-  Also implements DebugVisualizer protocol for environment-specific annotations
-  like arrows, ghost meshes, and coordinate frames.
 
-  Design boundary:
-  - This class owns render-handle lifecycle and geometry update internals.
-  - Viewer/overlay managers orchestrate *when* to request updates.
+@dataclass
+class _PerWorldHullGroup:
+  """One convex-hull handle covering the envs that share a hull variant."""
+
+  handle: viser.BatchedMeshHandle
+  body_id: int
+  env_ids: np.ndarray
+
+
+@dataclass
+class _HullVariant:
+  body_id: int
+  vertices: np.ndarray
+  faces: np.ndarray
+  env_ids: list[int] = field(default_factory=list)
+
+
+def _compute_body_hull(
+  mj_model: mujoco.MjModel, geom_ids: list[int]
+) -> trimesh.Trimesh | None:
+  """Compute a merged convex hull for a body's mesh geoms.
+
+  Bypasses ``mjviser.merge_geoms_hull`` (which reads ``mesh_polynum`` and
+  returns ``None`` for any mesh that MuJoCo didn't compile polygon data for --
+  a situation that arises for later per-world-mesh variants). Uses the raw
+  ``mesh_vert`` / ``mesh_face`` arrays and trimesh's convex hull instead.
+  """
+  pieces: list[trimesh.Trimesh] = []
+  for geom_id in geom_ids:
+    if int(mj_model.geom_type[geom_id]) != int(mjtGeom.mjGEOM_MESH):
+      continue
+    mesh_id = int(mj_model.geom_dataid[geom_id])
+    if mesh_id < 0:
+      continue
+    vert_start = int(mj_model.mesh_vertadr[mesh_id])
+    vert_count = int(mj_model.mesh_vertnum[mesh_id])
+    if vert_count < 4:
+      continue
+    vertices = mj_model.mesh_vert[vert_start : vert_start + vert_count].copy()
+    try:
+      piece = trimesh.PointCloud(vertices).convex_hull
+    except Exception:
+      continue
+    transform = np.eye(4)
+    transform[:3, :3] = vtf.SO3(mj_model.geom_quat[geom_id]).as_matrix()
+    transform[:3, 3] = mj_model.geom_pos[geom_id]
+    piece.apply_transform(transform)
+    pieces.append(piece)
+  if not pieces:
+    return None
+  merged = pieces[0] if len(pieces) == 1 else trimesh.util.concatenate(pieces)
+  try:
+    return merged.convex_hull
+  except Exception:
+    return merged
+
+
+class MjlabViserScene(ViserMujocoScene, DebugVisualizer):
+  """ViserMujocoScene with debug visualization and warp tensor conversion.
+
+  Adds debug primitives (arrows, ghosts, spheres, cylinders, ellipsoids,
+  coordinate frames) on top of the base scene from mjviser.
   """
 
-  # Core.
-  server: viser.ViserServer
-  mj_model: mujoco.MjModel
-  mj_data: mujoco.MjData
-  num_envs: int
-
-  # Handles (created once).
-  fixed_bodies_frame: viser.SceneNodeHandle = field(init=False)
-  mesh_handles_by_group: dict[tuple[int, int, int], viser.BatchedGlbHandle] = field(
-    default_factory=dict
-  )
-  site_handles_by_group: dict[tuple[int, int], viser.BatchedGlbHandle] = field(
-    default_factory=dict
-  )
-  contact_point_handle: viser.BatchedMeshHandle | None = None
-  contact_force_shaft_handle: viser.BatchedMeshHandle | None = None
-  contact_force_head_handle: viser.BatchedMeshHandle | None = None
-
-  # Visualization settings (set directly or automatically updated by create_options_gui).
-  env_idx: int = 0  # Current environment index (DebugVisualizer protocol).
-  camera_tracking_enabled: bool = True
-  show_only_selected: bool = False
-  geom_groups_visible: list[bool] = field(
-    default_factory=lambda: [True, True, True, False, False, False]
-  )
-  site_groups_visible: list[bool] = field(
-    default_factory=lambda: [True, True, True, False, False, False]
-  )
-  show_contact_points: bool = False
-  show_contact_forces: bool = False
-  contact_point_color: tuple[int, int, int] = _DEFAULT_CONTACT_POINT_COLOR
-  contact_force_color: tuple[int, int, int] = _DEFAULT_CONTACT_FORCE_COLOR
-  meansize_override: float | None = None
-  needs_update: bool = False
-  paused: bool = False
-  _tracked_body_id: int | None = field(init=False, default=None)
-
-  # Cached visualization state for re-rendering when settings change.
-  _last_body_xpos: np.ndarray | None = None
-  _last_body_xmat: np.ndarray | None = None
-  _last_mocap_pos: np.ndarray | None = None
-  _last_mocap_quat: np.ndarray | None = None
-  _last_env_idx: int = 0
-  _last_contacts: list[_Contact] | None = None
-
-  # Debug visualization (arrows, ghosts, frames).
-  debug_visualization_enabled: bool = False
-  show_all_envs: bool = False
-  _scene_offset: np.ndarray = field(default_factory=lambda: np.zeros(3), init=False)
-  _queued_arrows: list[
-    tuple[np.ndarray, np.ndarray, tuple[float, float, float, float], float]
-  ] = field(default_factory=list, init=False)
-  _arrow_shaft_handle: viser.BatchedMeshHandle | None = field(default=None, init=False)
-  _arrow_head_handle: viser.BatchedMeshHandle | None = field(default=None, init=False)
-  _queued_ghosts: list[
-    tuple[
-      np.ndarray,
-      mujoco.MjModel,
-      np.ndarray | None,
-      np.ndarray | None,
-      float,
-      str,
-    ]
-  ] = field(default_factory=list, init=False)
-  _ghost_handles_batched: dict[tuple[int, int], viser.BatchedMeshHandle] = field(
-    default_factory=dict, init=False
-  )
-  _ghost_meshes: dict[int, dict[int, trimesh.Trimesh]] = field(
-    default_factory=dict, init=False
-  )
-  _arrow_shaft_mesh: trimesh.Trimesh | None = field(default=None, init=False)
-  _arrow_head_mesh: trimesh.Trimesh | None = field(default=None, init=False)
-  _queued_spheres: list[tuple[np.ndarray, float, tuple[float, float, float, float]]] = (
-    field(default_factory=list, init=False)
-  )
-  _sphere_handle: viser.BatchedMeshHandle | None = field(default=None, init=False)
-  _sphere_mesh: trimesh.Trimesh | None = field(default=None, init=False)
-  _queued_cylinders: list[
-    tuple[np.ndarray, np.ndarray, float, tuple[float, float, float, float]]
-  ] = field(default_factory=list, init=False)
-  _cylinder_handle: viser.BatchedMeshHandle | None = field(default=None, init=False)
-  _cylinder_mesh: trimesh.Trimesh | None = field(default=None, init=False)
-  _queued_ellipsoids: list[
-    tuple[np.ndarray, np.ndarray, np.ndarray, tuple[float, float, float, float]]
-  ] = field(default_factory=list, init=False)
-  _ellipsoid_handle: viser.BatchedMeshHandle | None = field(default=None, init=False)
-  _ellipsoid_mesh: trimesh.Trimesh | None = field(default=None, init=False)
-  _fixed_site_handles: dict[tuple[int, int], viser.GlbHandle] = field(
-    default_factory=dict, init=False
-  )
-  _viz_data: mujoco.MjData = field(init=False)
-
-  @staticmethod
-  def create(
+  def __init__(
+    self,
     server: viser.ViserServer,
     mj_model: mujoco.MjModel,
     num_envs: int,
-  ) -> ViserMujocoScene:
-    """Create and populate scene with geometry.
+    sim_model: Any | None = None,
+    expanded_fields: set[str] | None = None,
+  ) -> None:
+    self._sim_model = sim_model
+    self._expanded_fields = expanded_fields or set()
+    self._baked_appearance_fields = (
+      self._expanded_fields & _VISER_APPEARANCE_HANDLE_FIELDS
+    )
+    self._baked_appearance_fingerprint: tuple[tuple[str, bytes], ...] | None = None
+    self._use_per_world_mesh_groups = bool(
+      self._expanded_fields & _VISER_BAKED_HANDLE_FIELDS
+    )
+    # Populated by _build_hull_handles when per-world variants are active.
+    # Initialized here because ViserMujocoScene.__init__ calls our overrides
+    # of _compute_hull_body_meshes / _build_hull_handles during super().__init__.
+    self._hull_per_world_groups: list[_PerWorldHullGroup] = []
+    if self._sim_model is not None:
+      sync_model_fields(
+        mj_model,
+        self._sim_model,
+        self._expanded_fields & VIEWER_MODEL_FIELDS,
+        0,
+      )
+      disable_model_sameframe_shortcuts(mj_model)
+    super().__init__(server, mj_model, num_envs)
+    self._baked_appearance_fingerprint = self._appearance_fingerprint()
 
-    Visual geometry is created immediately. Collision geometry is created
-    lazily when first needed.
+    self.debug_visualization_enabled = False
+    self.show_all_envs = False
 
-    Args:
-      server: Viser server instance.
-      mj_model: MuJoCo model.
-      num_envs: Number of parallel environments.
+    # Queued debug primitives (populated each frame, consumed by sync).
+    self._queued_arrows: list = []
+    self._queued_ghosts: list = []
+    self._queued_spheres: list = []
+    self._queued_cylinders: list = []
+    self._queued_ellipsoids: list = []
+    self._queued_boxes: list = []
 
-    Returns:
-      ViserMujocoScene instance with scene populated.
+    # Batched mesh handles for simple primitives.
+    def _shaft_mesh() -> trimesh.Trimesh:
+      m = trimesh.creation.cylinder(radius=1.0, height=1.0)
+      m.apply_translation(np.array([0, 0, 0.5]))
+      return m
+
+    self._arrow_shafts = _BatchedPrimitive("arrow_shafts", _shaft_mesh)
+    self._arrow_heads = _BatchedPrimitive(
+      "arrow_heads",
+      lambda: trimesh.creation.cone(radius=2.0, height=1.0),
+    )
+    self._spheres = _BatchedPrimitive(
+      "spheres",
+      lambda: trimesh.creation.icosphere(subdivisions=2, radius=1.0),
+    )
+    self._cylinders = _BatchedPrimitive(
+      "cylinders",
+      lambda: trimesh.creation.cylinder(radius=1.0, height=1.0),
+    )
+    self._ellipsoids = _BatchedPrimitive(
+      "ellipsoids",
+      lambda: trimesh.creation.icosphere(subdivisions=2, radius=1.0),
+    )
+    # Unit half-extents so that scaling by the box size yields the requested
+    # half-extents (extents=2 spans -1 to 1 along each axis).
+    self._boxes = _BatchedPrimitive(
+      "boxes",
+      lambda: trimesh.creation.box(extents=(2.0, 2.0, 2.0)),
+    )
+    self._all_primitives = [
+      self._arrow_shafts,
+      self._arrow_heads,
+      self._spheres,
+      self._cylinders,
+      self._ellipsoids,
+      self._boxes,
+    ]
+
+    # Ghost mesh state.
+    self._ghost_handles: dict[tuple[int, int], viser.BatchedMeshHandle] = {}
+    self._ghost_meshes: dict[int, dict[int, trimesh.Trimesh]] = {}
+
+    # MjData used for ghost forward kinematics.
+    self._viz_data = mujoco.MjData(mj_model)
+
+  # Properties.
+
+  @property
+  @override
+  def meansize(self) -> float:
+    return self.meansize_override or self.mj_model.stat.meansize
+
+  # Update entry points.
+
+  def update(self, wp_data, env_idx: int | None = None) -> None:
+    """Update scene from batched mjwarp simulation data.
+
+    Converts warp GPU tensors to numpy arrays and delegates to
+    ``update_from_arrays``.
     """
-    mj_data = mujoco.MjData(mj_model)
+    body_xpos = wp_data.xpos.cpu().numpy()
+    body_xmat = wp_data.xmat.cpu().numpy()
+    if self.mj_model.nmocap > 0:
+      mocap_pos = wp_data.mocap_pos.cpu().numpy()
+      mocap_quat = wp_data.mocap_quat.cpu().numpy()
+    else:
+      mocap_pos = None
+      mocap_quat = None
 
-    scene = ViserMujocoScene(
-      server=server,
-      mj_model=mj_model,
-      mj_data=mj_data,
-      num_envs=num_envs,
+    kwargs: dict[str, np.ndarray] = {}
+    if self._any_decor_visible():
+      kwargs["qpos"] = wp_data.qpos.cpu().numpy()
+      kwargs["qvel"] = wp_data.qvel.cpu().numpy()
+      if self.mj_model.nu > 0:
+        kwargs["ctrl"] = wp_data.ctrl.cpu().numpy()
+
+    self.update_from_arrays(
+      body_xpos,
+      body_xmat,
+      mocap_pos,
+      mocap_quat,
+      env_idx,
+      **kwargs,
     )
 
-    # Initialize debug visualization data.
-    scene._viz_data = mujoco.MjData(mj_model)
-
-    # Configure environment lighting.
-    server.scene.configure_environment_map(
-      environment_intensity=_DEFAULT_ENVIRONMENT_INTENSITY
+  @override
+  def update_from_arrays(
+    self,
+    body_xpos: np.ndarray,
+    body_xmat: np.ndarray,
+    mocap_pos: np.ndarray | None = None,
+    mocap_quat: np.ndarray | None = None,
+    env_idx: int | None = None,
+    qpos: np.ndarray | None = None,
+    qvel: np.ndarray | None = None,
+    ctrl: np.ndarray | None = None,
+  ) -> None:
+    """Update scene and sync debug visualizations."""
+    if env_idx is None:
+      env_idx = self.env_idx
+    self._sync_model_fields(env_idx)
+    super().update_from_arrays(
+      body_xpos,
+      body_xmat,
+      mocap_pos,
+      mocap_quat,
+      env_idx,
+      qpos=qpos,
+      qvel=qvel,
+      ctrl=ctrl,
     )
+    self._sync_debug_visualizations(self._scene_offset)
 
-    # Create frame for fixed world geometry.
-    scene.fixed_bodies_frame = server.scene.add_frame("/fixed_bodies", show_axes=False)
+  @override
+  def update_from_mjdata(self, mj_data: mujoco.MjData) -> None:
+    """Update scene and sync debug visualizations."""
+    self._sync_model_fields(self.env_idx)
+    super().update_from_mjdata(mj_data)
+    self._sync_debug_visualizations(self._scene_offset)
 
-    # Add fixed geometry (planes, terrain, etc.).
-    scene._add_fixed_geometry()
+  def _sync_model_fields(self, env_idx: int) -> None:
+    """Sync visually relevant per-world model fields into the host MjModel."""
+    if self._sim_model is None:
+      return
+    fields = self._expanded_fields & VIEWER_MODEL_FIELDS
+    sync_model_fields(self.mj_model, self._sim_model, fields, env_idx)
+    self._rebuild_visual_handles_if_needed()
 
-    # Create mesh handles per geom group.
-    scene._create_mesh_handles_by_group()
+  def _appearance_fingerprint(self) -> tuple[tuple[str, bytes], ...] | None:
+    """Return a stable fingerprint for fields baked into Viser mesh handles."""
+    if self._sim_model is None or not self._baked_appearance_fields:
+      return None
+    parts: list[tuple[str, bytes]] = []
+    for field_name in sorted(self._baked_appearance_fields):
+      value = getattr(self._sim_model, field_name).cpu().numpy()
+      parts.append((field_name, value.tobytes()))
+    return tuple(parts)
 
-    # Add fixed site geometry.
-    scene._add_fixed_sites()
+  def _rebuild_visual_handles_if_needed(self) -> None:
+    if self._baked_appearance_fingerprint is None:
+      return
+    fingerprint = self._appearance_fingerprint()
+    if fingerprint == self._baked_appearance_fingerprint:
+      return
+    self._baked_appearance_fingerprint = fingerprint
+    self.rebuild_visual_handles()
 
-    # Create site handles per site group.
-    scene._create_site_handles_by_group()
+  @staticmethod
+  def _geom_subgroup_visual_fingerprint(
+    mj_model: mujoco.MjModel, geom_ids: list[int], is_mocap: bool
+  ) -> tuple[object, ...]:
+    parts: list[tuple[object, ...]] = []
+    for geom_id in geom_ids:
+      mat_id = int(mj_model.geom_matid[geom_id])
+      mat_rgba = (
+        tuple(mj_model.mat_rgba[mat_id].round(4).tolist()) if mat_id >= 0 else None
+      )
+      parts.append(
+        (
+          int(mj_model.geom_type[geom_id]),
+          int(mj_model.geom_dataid[geom_id]),
+          mat_id,
+          mat_rgba,
+          tuple(mj_model.geom_size[geom_id].round(6).tolist()),
+          tuple(mj_model.geom_rgba[geom_id].round(4).tolist()),
+          tuple(mj_model.geom_pos[geom_id].round(6).tolist()),
+          tuple(mj_model.geom_quat[geom_id].round(6).tolist()),
+        )
+      )
+    return (is_mocap, tuple(sorted(parts)))
 
-    # Find first non-fixed body for camera tracking.
-    for body_id in range(mj_model.nbody):
-      if not is_fixed_body(mj_model, body_id):
-        scene._tracked_body_id = body_id
-        break
+  @override
+  def _create_mesh_handles_by_group(self) -> None:
+    """Create dynamic mesh handles, respecting per-world mesh variants."""
+    if not self._use_per_world_mesh_groups:
+      super()._create_mesh_handles_by_group()
+      return
 
-    return scene
+    variants: dict[tuple[object, ...], _VariantMeshGroup] = {}
+    for env_idx in range(self.num_envs):
+      self._sync_model_fields(env_idx)
+      body_group_geoms: dict[tuple[int, int], list[int]] = {}
+      for geom_id in range(self.mj_model.ngeom):
+        body_id = int(self.mj_model.geom_bodyid[geom_id])
+        if is_fixed_body(self.mj_model, body_id):
+          continue
+        if self.mj_model.geom_rgba[geom_id, 3] == 0:
+          continue
+        if (
+          int(self.mj_model.geom_type[geom_id]) == int(mjtGeom.mjGEOM_MESH)
+          and int(self.mj_model.geom_dataid[geom_id]) < 0
+        ):
+          continue
+        group_id = int(self.mj_model.geom_group[geom_id])
+        body_group_geoms.setdefault((body_id, group_id), []).append(geom_id)
 
-  def _is_collision_geom(self, geom_id: int) -> bool:
-    """Check if a geom is a collision geom."""
-    return (
-      self.mj_model.geom_contype[geom_id] != 0
-      or self.mj_model.geom_conaffinity[geom_id] != 0
-    )
+      for (body_id, group_id), geom_ids in body_group_geoms.items():
+        subgroups = group_geoms_by_visual_compat(self.mj_model, geom_ids)
+        is_mocap = bool(self.mj_model.body_mocapid[body_id] >= 0)
+        for sub_idx, sub_geom_ids in enumerate(subgroups):
+          fp = self._geom_subgroup_visual_fingerprint(
+            self.mj_model, sub_geom_ids, is_mocap
+          )
+          key = (fp, group_id, sub_idx)
+          variant = variants.get(key)
+          if variant is None:
+            variant = _VariantMeshGroup(
+              mesh=merge_geoms(self.mj_model, sub_geom_ids),
+              group_id=group_id,
+              sub_idx=sub_idx,
+              body_name=get_body_name(self.mj_model, body_id),
+              is_mocap=is_mocap,
+            )
+            variants[key] = variant
+          variant.env_ids.append(env_idx)
+          variant.body_ids.append(body_id)
+          if is_mocap:
+            variant.mocap_ids.append(int(self.mj_model.body_mocapid[body_id]))
 
-  def _sync_visibilities(self) -> None:
-    """Synchronize all handle visibilities based on current flags."""
-    # Geom group meshes.
-    for (_body_id, group_id, _sub_idx), handle in self.mesh_handles_by_group.items():
-      handle.visible = group_id < 6 and self.geom_groups_visible[group_id]
+    self._sync_model_fields(self.env_idx)
+    with self.server.atomic():
+      for variant_idx, variant in enumerate(variants.values()):
+        batch_count = len(variant.env_ids)
+        lod_ratio = 1000.0 / variant.mesh.vertices.shape[0]
+        suffix = f"/sub{variant.sub_idx}" if variant.sub_idx > 0 else ""
+        visible = variant.group_id < 6 and self.geom_groups_visible[variant.group_id]
 
-    # Site group meshes (batched, non-fixed).
-    for (_body_id, group_id), handle in self.site_handles_by_group.items():
-      handle.visible = group_id < 6 and self.site_groups_visible[group_id]
+        handle = self.server.scene.add_batched_meshes_trimesh(
+          f"/bodies/{variant.body_name}/group{variant.group_id}"
+          f"/variant{variant_idx}{suffix}",
+          variant.mesh,
+          batched_wxyzs=np.tile([1.0, 0.0, 0.0, 0.0], (batch_count, 1)),
+          batched_positions=np.zeros((batch_count, 3)),
+          lod=((2.0, lod_ratio),) if lod_ratio < 0.5 else "off",
+          visible=visible,
+        )
+        cast(Any, self._mesh_groups).append(
+          _PerWorldMeshGroup(
+            handle=handle,
+            body_ids=np.asarray(variant.body_ids, dtype=np.int32),
+            group_id=variant.group_id,
+            mocap_ids=(
+              np.asarray(variant.mocap_ids, dtype=np.int32)
+              if variant.is_mocap
+              else None
+            ),
+            env_ids=np.asarray(variant.env_ids, dtype=np.int32),
+          )
+        )
 
-    # Fixed site meshes.
-    for (_body_id, group_id), handle in self._fixed_site_handles.items():
-      handle.visible = group_id < 6 and self.site_groups_visible[group_id]
+  @override
+  def _compute_hull_body_meshes(self) -> None:
+    """Record hull-bearing bodies across all variants; meshes built lazily."""
+    if not self._use_per_world_mesh_groups:
+      super()._compute_hull_body_meshes()
+      return
+    # Upstream caches one merged hull per body from the current mj_model.
+    # With per-world variants each env can have a different set of active
+    # mesh slots, so the actual hulls are computed per-variant in
+    # _build_hull_handles. Here we just record which bodies carry mesh hulls
+    # in any env so mjviser's _sync_visibilities / _hull_hide_meshes logic
+    # still has the right body set.
+    self._hull_body_meshes = {}
+    # Read the per-world geom_dataid table directly from sim_model: a body
+    # is a hull body iff any world has at least one active mesh geom on it,
+    # which is constant data we don't need to materialize per-env into
+    # mj_model to inspect.
+    assert self._sim_model is not None
+    dataid = self._sim_model.geom_dataid.cpu().numpy()
+    if dataid.ndim == 1:
+      dataid = dataid[None, :]
+    geom_active_in_any_world = (dataid >= 0).any(axis=0)
+    hull_bodies: set[int] = set()
+    for geom_id in range(self.mj_model.ngeom):
+      if int(self.mj_model.geom_type[geom_id]) != int(mjtGeom.mjGEOM_MESH):
+        continue
+      if not geom_active_in_any_world[geom_id]:
+        continue
+      hull_bodies.add(int(self.mj_model.geom_bodyid[geom_id]))
+    self._hull_mesh_bodies = hull_bodies
 
-    # Contact points.
-    if self.contact_point_handle is not None and not self.show_contact_points:
-      self.contact_point_handle.visible = False
+  @override
+  def _build_hull_handles(self) -> None:
+    """Build one batched hull handle per (body, variant) across envs."""
+    if not self._use_per_world_mesh_groups:
+      super()._build_hull_handles()
+      return
 
-    # Contact forces.
-    if not self.show_contact_forces:
-      if self.contact_force_shaft_handle is not None:
-        self.contact_force_shaft_handle.visible = False
-      if self.contact_force_head_handle is not None:
-        self.contact_force_head_handle.visible = False
+    color = np.array(self._hull_color, dtype=np.uint8)
+    opacity = float(self._hull_opacity)
 
-  def create_visualization_gui(
+    # Group envs by (body_id, hull fingerprint). Fingerprint captures the
+    # fields that merge_geoms_hull actually reads (geom_dataid + local
+    # geom_pos/quat), so any two envs with identical fingerprints share the
+    # same hull mesh in body-local space.
+    variants: dict[tuple[int, tuple[object, ...]], _HullVariant] = {}
+    fixed_hull_bodies: dict[int, list[int]] = {}
+
+    for env_idx in range(self.num_envs):
+      self._sync_model_fields(env_idx)
+      body_geoms: dict[int, list[int]] = {}
+      for geom_id in range(self.mj_model.ngeom):
+        if int(self.mj_model.geom_type[geom_id]) != int(mjtGeom.mjGEOM_MESH):
+          continue
+        if int(self.mj_model.geom_dataid[geom_id]) < 0:
+          continue
+        body_id = int(self.mj_model.geom_bodyid[geom_id])
+        body_geoms.setdefault(body_id, []).append(geom_id)
+
+      for body_id, geom_ids in body_geoms.items():
+        if is_fixed_body(self.mj_model, body_id):
+          # Fixed bodies don't need per-env batching; defer to upstream
+          # single-hull path using env_idx 0 (already the default).
+          if env_idx == 0:
+            fixed_hull_bodies[body_id] = geom_ids
+          continue
+        fingerprint = tuple(
+          (
+            int(self.mj_model.geom_dataid[gid]),
+            tuple(float(x) for x in self.mj_model.geom_pos[gid].round(6)),
+            tuple(float(x) for x in self.mj_model.geom_quat[gid].round(6)),
+          )
+          for gid in geom_ids
+        )
+        key = (body_id, fingerprint)
+        v = variants.get(key)
+        if v is None:
+          hull = _compute_body_hull(self.mj_model, geom_ids)
+          if hull is None:
+            continue
+          v = _HullVariant(
+            body_id=body_id,
+            vertices=hull.vertices.astype(np.float32),
+            faces=hull.faces.astype(np.int32),
+          )
+          variants[key] = v
+        v.env_ids.append(env_idx)
+
+    # Fixed bodies: build one hull handle each (same body-local mesh for all
+    # envs since the body is welded). Uses env 0's synced state which is the
+    # default after the loop below.
+    self._sync_model_fields(self.env_idx)
+    for body_id, geom_ids in fixed_hull_bodies.items():
+      hull = _compute_body_hull(self.mj_model, geom_ids)
+      if hull is None:
+        continue
+      body = self.mj_model.body(body_id)
+      fixed_opacities = (
+        None if opacity >= 1.0 else np.array([opacity], dtype=np.float32)
+      )
+      handle = self.server.scene.add_batched_meshes_simple(
+        f"/fixed_bodies/hull/{body_id}",
+        hull.vertices.astype(np.float32),
+        hull.faces.astype(np.int32),
+        batched_wxyzs=np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32),
+        batched_positions=np.zeros((1, 3), dtype=np.float32),
+        batched_colors=color[None],
+        batched_opacities=fixed_opacities,
+        position=body.pos,
+        wxyz=body.quat,
+        visible=self._show_convex_hull,
+        cast_shadow=False,
+        receive_shadow=False,
+        lod="off",
+      )
+      self._hull_fixed_handles[body_id] = handle
+
+    self._hull_dynamic_handles = []
+    self._hull_per_world_groups = []
+    for variant_idx, ((body_id, _fp), v) in enumerate(variants.items()):
+      env_ids = np.asarray(v.env_ids, dtype=np.int32)
+      batch_count = int(env_ids.size)
+      dynamic_opacities = (
+        None if opacity >= 1.0 else np.full(batch_count, opacity, dtype=np.float32)
+      )
+      handle = self.server.scene.add_batched_meshes_simple(
+        f"/hull/{body_id}/variant{variant_idx}",
+        v.vertices,
+        v.faces,
+        batched_wxyzs=np.tile([1.0, 0.0, 0.0, 0.0], (batch_count, 1)).astype(
+          np.float32
+        ),
+        batched_positions=np.zeros((batch_count, 3), dtype=np.float32),
+        batched_colors=np.tile(color, (batch_count, 1)),
+        batched_opacities=dynamic_opacities,
+        visible=self._show_convex_hull,
+        cast_shadow=False,
+        receive_shadow=False,
+        lod="off",
+      )
+      self._hull_per_world_groups.append(
+        _PerWorldHullGroup(handle=handle, body_id=body_id, env_ids=env_ids)
+      )
+      # Also register in the upstream list so show_convex_hull.setter and
+      # any other base-class consumer still see every dynamic hull handle.
+      self._hull_dynamic_handles.append((handle, body_id))
+
+  @override
+  def _clear_hull_handles(self) -> None:
+    super()._clear_hull_handles()
+    self._hull_per_world_groups = []
+
+  @override
+  def _update_visualization_locked(
+    self,
+    body_xpos: np.ndarray,
+    body_xmat: np.ndarray,
+    mocap_pos: np.ndarray,
+    mocap_quat: np.ndarray,
+    env_idx: int,
+    scene_offset: np.ndarray,
+    mj_data: mujoco.MjData | None = None,
+  ) -> None:
+    if not self._use_per_world_mesh_groups:
+      super()._update_visualization_locked(
+        body_xpos, body_xmat, mocap_pos, mocap_quat, env_idx, scene_offset, mj_data
+      )
+      return
+
+    self._last_body_xpos = body_xpos
+    self._last_body_xmat = body_xmat
+    self._last_mocap_pos = mocap_pos
+    self._last_mocap_quat = mocap_quat
+    self._last_env_idx = env_idx
+    self._scene_offset = scene_offset
+    if mj_data is not None:
+      self._last_mj_data = mj_data
+
+    self.fixed_bodies_frame.position = scene_offset
+    slice_single = self.show_only_selected and self.num_envs > 1
+    hidden_bodies: set[int] = set()
+    if self._show_convex_hull and self._hull_hide_meshes:
+      hidden_bodies = self._hull_mesh_bodies
+    if (
+      self._mjv_option.flags[mujoco.mjtVisFlag.mjVIS_AUTOCONNECT]
+      and self._autoconnect_hide_meshes
+    ):
+      hidden_bodies |= set(range(self.mj_model.nbody))
+
+    with self.server.atomic():
+      body_xquat = vtf.SO3.from_matrix(body_xmat).wxyz
+      for mg in self._mesh_groups:
+        if isinstance(mg, _PerWorldMeshGroup):
+          visible = mg.group_id < 6 and self.geom_groups_visible[mg.group_id]
+          if visible and any(body_id in hidden_bodies for body_id in mg.body_ids):
+            visible = False
+          if not visible:
+            mg.handle.visible = False
+            continue
+
+          env_ids = mg.env_ids
+          body_ids = mg.body_ids
+          mocap_ids = mg.mocap_ids
+          if slice_single:
+            mask = env_ids == env_idx
+            if not np.any(mask):
+              mg.handle.visible = False
+              continue
+            env_ids = env_ids[mask]
+            body_ids = body_ids[mask]
+            if mocap_ids is not None:
+              mocap_ids = mocap_ids[mask]
+          if mocap_ids is not None:
+            pos = mocap_pos[env_ids, mocap_ids] + scene_offset
+            quat = mocap_quat[env_ids, mocap_ids]
+          else:
+            pos = body_xpos[env_ids, body_ids] + scene_offset
+            quat = body_xquat[env_ids, body_ids]
+          mg.handle.batched_positions = pos
+          mg.handle.batched_wxyzs = quat
+          mg.handle.visible = True
+          continue
+
+        if not mg.handle.visible:
+          continue
+        if mg.mocap_ids is not None:
+          pos, quat = self._batched_transform_group(
+            mocap_pos, mocap_quat, mg.mocap_ids, env_idx, scene_offset, slice_single
+          )
+        else:
+          pos, quat = self._batched_transform_group(
+            body_xpos, body_xquat, mg.body_ids, env_idx, scene_offset, slice_single
+          )
+        mg.handle.batched_positions = pos
+        mg.handle.batched_wxyzs = quat
+
+      for (body_id, _), handle in self.site_handles_by_group.items():
+        if not handle.visible:
+          continue
+        pos, quat = self._batched_transform(
+          body_xpos, body_xquat, body_id, env_idx, scene_offset, slice_single
+        )
+        handle.batched_positions = pos
+        handle.batched_wxyzs = quat
+
+      if self._show_convex_hull:
+        for hg in self._hull_per_world_groups:
+          env_ids = hg.env_ids
+          body_id = hg.body_id
+          if slice_single:
+            mask = env_ids == env_idx
+            if not np.any(mask):
+              hg.handle.visible = False
+              continue
+            env_ids = env_ids[mask]
+          pos = body_xpos[env_ids, body_id] + scene_offset
+          quat = body_xquat[env_ids, body_id]
+          hg.handle.batched_positions = pos
+          hg.handle.batched_wxyzs = quat
+          hg.handle.visible = True
+
+      if self._any_decor_visible() and mj_data is not None:
+        self._update_decor_from_mjvscene(mj_data, scene_offset)
+      elif not self._any_decor_visible():
+        self._clear_decor_handles()
+
+      self.server.flush()
+
+  # Refresh.
+
+  @override
+  def refresh_visualization(self) -> None:
+    """Re-render, keeping needs_update set when debug viz is active."""
+    super().refresh_visualization()
+    self._sync_debug_visualizations(self._scene_offset)
+    if self.debug_visualization_enabled:
+      self.needs_update = True
+
+  # GUI.
+
+  @override
+  def create_scene_gui(
     self,
     camera_distance: float = 3.0,
     camera_azimuth: float = 45.0,
@@ -278,97 +804,13 @@ class ViserMujocoScene(DebugVisualizer):
     show_debug_viz_control: bool = True,
     debug_viz_extra_gui: Callable[[], None] | None = None,
   ) -> None:
-    """Add standard GUI controls that automatically update this scene's settings.
-
-    Args:
-      camera_distance: Default camera distance from tracked body when tracking is enabled.
-      camera_azimuth: Default camera azimuth angle in degrees.
-      camera_elevation: Default camera elevation angle in degrees.
-      show_debug_viz_control: Whether to show the debug visualization checkbox.
-      debug_viz_extra_gui: Optional callback invoked inside the Debug Viz
-        folder to add extra controls (e.g., per-term toggles).
-    """
-    # Environment selection (only if multiple environments).
-    if self.num_envs > 1:
-      with self.server.gui.add_folder("Environment"):
-        env_slider = self.server.gui.add_slider(
-          "Select",
-          min=0,
-          max=self.num_envs - 1,
-          step=1,
-          initial_value=self.env_idx,
-          hint=f"Select environment (0-{self.num_envs - 1})",
-        )
-
-        @env_slider.on_update
-        def _(_) -> None:
-          self.env_idx = int(env_slider.value)
-          self._request_update()
-
-        show_only_cb = self.server.gui.add_checkbox(
-          "Hide others",
-          initial_value=self.show_only_selected,
-          hint="Show only the selected environment.",
-        )
-
-        @show_only_cb.on_update
-        def _(_) -> None:
-          self.show_only_selected = show_only_cb.value
-          self._request_update()
-
-    # Precompute default camera position for tracking snap.
-    _az_rad = np.deg2rad(camera_azimuth)
-    _el_rad = np.deg2rad(camera_elevation)
-    _default_camera_pos = (
-      -np.array(
-        [
-          np.cos(_el_rad) * np.cos(_az_rad),
-          np.cos(_el_rad) * np.sin(_az_rad),
-          np.sin(_el_rad),
-        ]
-      )
-      * camera_distance
+    """Add standard GUI controls plus debug visualization section."""
+    super().create_scene_gui(
+      camera_distance=camera_distance,
+      camera_azimuth=camera_azimuth,
+      camera_elevation=camera_elevation,
     )
 
-    # Camera controls.
-    with self.server.gui.add_folder("Camera"):
-      cb_camera_tracking = self.server.gui.add_checkbox(
-        "Track camera",
-        initial_value=self.camera_tracking_enabled,
-        hint="Keep tracked body centered. Use Viser camera controls to adjust view.",
-      )
-
-      @cb_camera_tracking.on_update
-      def _(_) -> None:
-        self.camera_tracking_enabled = cb_camera_tracking.value
-        if self.camera_tracking_enabled:
-          for client in self.server.get_clients().values():
-            client.camera.position = _default_camera_pos
-            client.camera.look_at = np.zeros(3)
-        self._request_update()
-
-      slider_fov = self.server.gui.add_slider(
-        "FOV (°)",
-        min=_DEFAULT_FOV_MIN,
-        max=_DEFAULT_FOV_MAX,
-        step=1,
-        initial_value=_DEFAULT_FOV_DEGREES,
-        hint="Vertical FOV of viewer camera, in degrees.",
-      )
-
-      @slider_fov.on_update
-      def _(_) -> None:
-        for client in self.server.get_clients().values():
-          client.camera.fov = np.radians(slider_fov.value)
-
-      @self.server.on_client_connect
-      def _(client: viser.ClientHandle) -> None:
-        client.camera.fov = np.radians(slider_fov.value)
-        if self.camera_tracking_enabled:
-          client.camera.position = _default_camera_pos
-          client.camera.look_at = np.zeros(3)
-
-    # Debug visualization controls (only show if requested).
     if show_debug_viz_control:
       with self.server.gui.add_folder("Debug Viz"):
         cb_debug_vis = self.server.gui.add_checkbox(
@@ -380,10 +822,9 @@ class ViserMujocoScene(DebugVisualizer):
         @cb_debug_vis.on_update
         def _(_) -> None:
           self.debug_visualization_enabled = cb_debug_vis.value
-          # Clear visualizer if hiding.
           if not self.debug_visualization_enabled:
             self.clear_debug_all()
-          self._request_update()
+          self.request_update()
 
         cb_show_all_envs = self.server.gui.add_checkbox(
           "All envs",
@@ -394,682 +835,14 @@ class ViserMujocoScene(DebugVisualizer):
         @cb_show_all_envs.on_update
         def _(_) -> None:
           self.show_all_envs = cb_show_all_envs.value
-          # Clear ghosts when switching from all envs to single env
           if not self.show_all_envs:
             self.clear_debug_all()
-          self._request_update()
+          self.request_update()
 
         if debug_viz_extra_gui is not None:
           debug_viz_extra_gui()
 
-    # Contact visualization settings.
-    with self.server.gui.add_folder("Contacts"):
-      cb_contact_points = self.server.gui.add_checkbox(
-        "Points",
-        initial_value=False,
-        hint="Toggle contact point visualization.",
-      )
-      contact_point_color = self.server.gui.add_rgb(
-        "Points Color", initial_value=self.contact_point_color
-      )
-      cb_contact_forces = self.server.gui.add_checkbox(
-        "Forces",
-        initial_value=False,
-        hint="Toggle contact force visualization.",
-      )
-      contact_force_color = self.server.gui.add_rgb(
-        "Forces Color", initial_value=self.contact_force_color
-      )
-      meansize_input = self.server.gui.add_number(
-        "Scale",
-        step=self.mj_model.stat.meansize * 0.01,
-        initial_value=self.mj_model.stat.meansize,
-      )
-
-      @cb_contact_points.on_update
-      def _(_) -> None:
-        self.show_contact_points = cb_contact_points.value
-        self._sync_visibilities()
-        self._request_update()
-
-      @contact_point_color.on_update
-      def _(_) -> None:
-        self.contact_point_color = contact_point_color.value
-        if self.contact_point_handle is not None:
-          self.contact_point_handle.remove()
-          self.contact_point_handle = None
-        self._request_update()
-
-      @cb_contact_forces.on_update
-      def _(_) -> None:
-        self.show_contact_forces = cb_contact_forces.value
-        self._sync_visibilities()
-        self._request_update()
-
-      @contact_force_color.on_update
-      def _(_) -> None:
-        self.contact_force_color = contact_force_color.value
-        if self.contact_force_shaft_handle is not None:
-          self.contact_force_shaft_handle.remove()
-          self.contact_force_shaft_handle = None
-        if self.contact_force_head_handle is not None:
-          self.contact_force_head_handle.remove()
-          self.contact_force_head_handle = None
-        self._request_update()
-
-      @meansize_input.on_update
-      def _(_) -> None:
-        self.meansize_override = meansize_input.value
-        self._request_update()
-
-  def create_groups_gui(self, tabs) -> None:
-    """Add unified groups tab with geoms and sites folders.
-
-    Args:
-      tabs: The viser tab group to add the groups tab to.
-    """
-    with tabs.add_tab("Groups", icon=viser.Icon.EYE):
-      # Geoms folder
-      with self.server.gui.add_folder("Geoms"):
-        for i in range(6):
-          cb = self.server.gui.add_checkbox(
-            f"G{i}",
-            initial_value=self.geom_groups_visible[i],
-            hint=f"Show/hide geometry in group {i}",
-          )
-
-          @cb.on_update
-          def _(event, group_idx=i) -> None:
-            self.geom_groups_visible[group_idx] = event.target.value
-            self._sync_visibilities()
-            self._request_update()
-
-      # Sites folder
-      with self.server.gui.add_folder("Sites"):
-        for i in range(6):
-          cb = self.server.gui.add_checkbox(
-            f"S{i}",
-            initial_value=self.site_groups_visible[i],
-            hint=f"Show/hide sites in group {i}",
-          )
-
-          @cb.on_update
-          def _(event, group_idx=i) -> None:
-            self.site_groups_visible[group_idx] = event.target.value
-            self._sync_visibilities()
-            self._request_update()
-
-  def update(self, wp_data, env_idx: int | None = None) -> None:
-    """Update scene from batched simulation data.
-
-    Args:
-      wp_data: Batched Warp simulation data (mjwarp.Data).
-      env_idx: Environment index to visualize. If None, uses self.env_idx.
-    """
-    if env_idx is None:
-      env_idx = self.env_idx
-
-    body_xpos = wp_data.xpos.cpu().numpy()
-    body_xmat = wp_data.xmat.cpu().numpy()
-    if self.mj_model.nmocap > 0:
-      mocap_pos = wp_data.mocap_pos.cpu().numpy()
-      mocap_quat = wp_data.mocap_quat.cpu().numpy()
-    else:
-      nworld = body_xpos.shape[0]
-      mocap_pos = np.zeros((nworld, 0, 3))
-      mocap_quat = np.zeros((nworld, 0, 4))
-    scene_offset = np.zeros(3)
-    if self.camera_tracking_enabled and self._tracked_body_id is not None:
-      tracked_pos = body_xpos[env_idx, self._tracked_body_id, :].copy()
-      scene_offset = -tracked_pos
-
-    contacts = None
-    if self.show_contact_points or self.show_contact_forces:
-      self.mj_data.qpos[:] = wp_data.qpos.cpu().numpy()[env_idx]
-      self.mj_data.qvel[:] = wp_data.qvel.cpu().numpy()[env_idx]
-      if self.mj_model.nu > 0:
-        self.mj_data.ctrl[:] = wp_data.ctrl.cpu().numpy()[env_idx]
-      if self.mj_model.nmocap > 0:
-        self.mj_data.mocap_pos[:] = mocap_pos[env_idx]
-        self.mj_data.mocap_quat[:] = mocap_quat[env_idx]
-      mujoco.mj_forward(self.mj_model, self.mj_data)
-      contacts = self._extract_contacts_from_mjdata(self.mj_data)
-
-    self._update_visualization(
-      body_xpos, body_xmat, mocap_pos, mocap_quat, env_idx, scene_offset, contacts
-    )
-
-    self._sync_debug_visualizations(scene_offset)
-
-  def update_from_mjdata(self, mj_data: mujoco.MjData) -> None:
-    """Update scene from single-environment MuJoCo data.
-
-    Args:
-      mj_data: Single environment MuJoCo data.
-    """
-    body_xpos = mj_data.xpos[None, ...]
-    body_xmat = mj_data.xmat.reshape(-1, 3, 3)[None, ...]
-    if self.mj_model.nmocap > 0:
-      mocap_pos = mj_data.mocap_pos[None, ...]
-      mocap_quat = mj_data.mocap_quat[None, ...]
-    else:
-      mocap_pos = np.zeros((1, 0, 3))
-      mocap_quat = np.zeros((1, 0, 4))
-    env_idx = 0
-    scene_offset = np.zeros(3)
-    if self.camera_tracking_enabled and self._tracked_body_id is not None:
-      tracked_pos = mj_data.xpos[self._tracked_body_id, :].copy()
-      scene_offset = -tracked_pos
-
-    # Always extract contacts for single-environment updates (used by nan_viz).
-    # This allows toggling contact visualization without needing to scrub timesteps.
-    # Not performance-critical since this isn't called in tight loops.
-    contacts = self._extract_contacts_from_mjdata(mj_data)
-
-    self._update_visualization(
-      body_xpos, body_xmat, mocap_pos, mocap_quat, env_idx, scene_offset, contacts
-    )
-
-    self._sync_debug_visualizations(scene_offset)
-
-  def _sync_debug_visualizations(self, scene_offset: np.ndarray) -> None:
-    """Sync all debug visualizations (arrows, spheres, cylinders, ghosts)."""
-    if not self.debug_visualization_enabled:
-      return
-    self._scene_offset = scene_offset
-    self._sync_arrows()
-    self._sync_spheres()
-    self._sync_cylinders()
-    self._sync_ellipsoids()
-    self._sync_ghosts()
-
-  def _update_visualization(
-    self,
-    body_xpos: np.ndarray,
-    body_xmat: np.ndarray,
-    mocap_pos: np.ndarray,
-    mocap_quat: np.ndarray,
-    env_idx: int,
-    scene_offset: np.ndarray,
-    contacts: list[_Contact] | None,
-  ) -> None:
-    """Shared visualization update logic."""
-    # Cache visualization state for re-rendering when settings change.
-    self._last_body_xpos = body_xpos
-    self._last_body_xmat = body_xmat
-    self._last_mocap_pos = mocap_pos
-    self._last_mocap_quat = mocap_quat
-    self._last_env_idx = env_idx
-    self._scene_offset = scene_offset
-    # Only update cached contacts if we have new contact data (don't overwrite with None)
-    if contacts is not None:
-      self._last_contacts = contacts
-
-    self.fixed_bodies_frame.position = scene_offset
-    with self.server.atomic():
-      body_xquat = vtf.SO3.from_matrix(body_xmat).wxyz
-      for (body_id, _group_id, _sub_idx), handle in self.mesh_handles_by_group.items():
-        if not handle.visible:
-          continue
-        # Check if this is a mocap body.
-        mocap_id = self.mj_model.body_mocapid[body_id]
-        if mocap_id >= 0:
-          # Use mocap pos/quat for mocap bodies.
-          # Note: mocap_quat is already in wxyz format (MuJoCo convention).
-          if self.show_only_selected and self.num_envs > 1:
-            single_pos = mocap_pos[env_idx, mocap_id, :] + scene_offset
-            single_quat = mocap_quat[env_idx, mocap_id, :]
-            handle.batched_positions = np.tile(single_pos[None, :], (self.num_envs, 1))
-            handle.batched_wxyzs = np.tile(single_quat[None, :], (self.num_envs, 1))
-          else:
-            handle.batched_positions = mocap_pos[:, mocap_id, :] + scene_offset
-            handle.batched_wxyzs = mocap_quat[:, mocap_id, :]
-        else:
-          # Use xpos/xmat for regular bodies.
-          if self.show_only_selected and self.num_envs > 1:
-            single_pos = body_xpos[env_idx, body_id, :] + scene_offset
-            single_quat = body_xquat[env_idx, body_id, :]
-            handle.batched_positions = np.tile(single_pos[None, :], (self.num_envs, 1))
-            handle.batched_wxyzs = np.tile(single_quat[None, :], (self.num_envs, 1))
-          else:
-            handle.batched_positions = body_xpos[..., body_id, :] + scene_offset
-            handle.batched_wxyzs = body_xquat[..., body_id, :]
-      # Update site handle positions (no mocap check needed for sites).
-      for (body_id, _group_id), handle in self.site_handles_by_group.items():
-        if not handle.visible:
-          continue
-        if self.show_only_selected and self.num_envs > 1:
-          single_pos = body_xpos[env_idx, body_id, :] + scene_offset
-          single_quat = body_xquat[env_idx, body_id, :]
-          handle.batched_positions = np.tile(single_pos[None, :], (self.num_envs, 1))
-          handle.batched_wxyzs = np.tile(single_quat[None, :], (self.num_envs, 1))
-        else:
-          handle.batched_positions = body_xpos[..., body_id, :] + scene_offset
-          handle.batched_wxyzs = body_xquat[..., body_id, :]
-      if contacts is not None:
-        self._update_contact_visualization(contacts, scene_offset)
-
-      self.server.flush()
-
-  def _request_update(self) -> None:
-    """Request a visualization update and trigger immediate re-render from cache.
-
-    This is called when visualization settings change to provide immediate feedback.
-    For viewers with continuous update loops (viser_play), the loop will refresh soon.
-    For static viewers (nan_viz), this provides the only update mechanism.
-    """
-    self.needs_update = True
-    self.refresh_visualization()
-
-  def refresh_visualization(self) -> None:
-    """Re-render the scene using cached visualization data.
-
-    This is useful when visualization settings change (e.g., toggling contacts)
-    but the underlying simulation data hasn't changed.
-    """
-    if (
-      self._last_body_xpos is None
-      or self._last_body_xmat is None
-      or self._last_mocap_pos is None
-      or self._last_mocap_quat is None
-    ):
-      return  # No cached data yet
-
-    # Use cached contacts (don't recompute - the data might be stale).
-    # The next regular update will refresh contacts if needed.
-    contacts = (
-      self._last_contacts
-      if (self.show_contact_points or self.show_contact_forces)
-      else None
-    )
-
-    # Recalculate scene offset based on current camera tracking state.
-    scene_offset = np.zeros(3)
-    if self.camera_tracking_enabled and self._tracked_body_id is not None:
-      tracked_pos = self._last_body_xpos[
-        self._last_env_idx, self._tracked_body_id, :
-      ].copy()
-      scene_offset = -tracked_pos
-
-    # Re-render with cached data (_update_visualization has its own atomic block and flush)
-    self._update_visualization(
-      self._last_body_xpos,
-      self._last_body_xmat,
-      self._last_mocap_pos,
-      self._last_mocap_quat,
-      self._last_env_idx,
-      scene_offset,
-      contacts,
-    )
-    # Keep one live refresh pending when overlays depend on live sim state.
-    # This covers contact toggles and paused debug-viz toggles (e.g. ghosts),
-    # which otherwise can require stepping/unpausing to appear.
-    self.needs_update = self._requires_live_refresh(
-      show_contact_points=self.show_contact_points,
-      show_contact_forces=self.show_contact_forces,
-      debug_visualization_enabled=self.debug_visualization_enabled,
-    )
-
-  @staticmethod
-  def _requires_live_refresh(
-    *,
-    show_contact_points: bool,
-    show_contact_forces: bool,
-    debug_visualization_enabled: bool,
-  ) -> bool:
-    """Whether scene should request one live recompute after cached refresh."""
-    return show_contact_points or show_contact_forces or debug_visualization_enabled
-
-  def _add_fixed_geometry(self) -> None:
-    """Add fixed world geometry to the scene."""
-    body_geoms_visual: dict[int, list[int]] = {}
-    body_geoms_collision: dict[int, list[int]] = {}
-
-    for i in range(self.mj_model.ngeom):
-      body_id = self.mj_model.geom_bodyid[i]
-      target = body_geoms_collision if self._is_collision_geom(i) else body_geoms_visual
-      target.setdefault(body_id, []).append(i)
-
-    # Process all bodies with geoms.
-    all_bodies = set(body_geoms_visual.keys()) | set(body_geoms_collision.keys())
-
-    for body_id in all_bodies:
-      # Get body name.
-      body_name = get_body_name(self.mj_model, body_id)
-
-      # Fixed world geometry. We'll assume this is shared between all environments.
-      if is_fixed_body(self.mj_model, body_id):
-        # Create both visual and collision geoms for fixed bodies (terrain, floor, etc.)
-        # but show them all since they're static.
-        all_geoms = []
-        if body_id in body_geoms_visual:
-          all_geoms.extend(body_geoms_visual[body_id])
-        if body_id in body_geoms_collision:
-          all_geoms.extend(body_geoms_collision[body_id])
-
-        if not all_geoms:
-          continue
-
-        # Iterate over geoms.
-        nonplane_geom_ids: list[int] = []
-        for geom_id in all_geoms:
-          geom_type = self.mj_model.geom_type[geom_id]
-          # Add plane geoms as infinite grids.
-          if geom_type == mjtGeom.mjGEOM_PLANE:
-            geom_name = mj_id2name(self.mj_model, mjtObj.mjOBJ_GEOM, geom_id)
-            self.server.scene.add_grid(
-              f"/fixed_bodies/{body_name}/{geom_name}",
-              infinite_grid=True,
-              fade_distance=50.0,
-              shadow_opacity=0.2,
-              plane_opacity=0.4,
-              position=self.mj_model.geom_pos[geom_id],
-              wxyz=self.mj_model.geom_quat[geom_id],
-            )
-          else:
-            nonplane_geom_ids.append(geom_id)
-
-        # Handle non-plane geoms — split by visual compatibility to avoid
-        # gray fallback when mixing TextureVisuals and ColorVisuals.
-        if len(nonplane_geom_ids) > 0:
-          subgroups = group_geoms_by_visual_compat(self.mj_model, nonplane_geom_ids)
-          for sub_idx, sub_geom_ids in enumerate(subgroups):
-            suffix = f"/sub{sub_idx}" if len(subgroups) > 1 else ""
-            self.server.scene.add_mesh_trimesh(
-              f"/fixed_bodies/{body_name}{suffix}",
-              merge_geoms(self.mj_model, sub_geom_ids),
-              cast_shadow=False,
-              receive_shadow=0.2,
-              position=self.mj_model.body(body_id).pos,
-              wxyz=self.mj_model.body(body_id).quat,
-              visible=True,
-            )
-
-  def _create_mesh_handles_by_group(self) -> None:
-    """Create mesh handles for each geom group separately to allow independent toggling.
-
-    Note: geom_rgba DR is not currently reflected in viser. All dynamic geoms go
-    through add_batched_meshes_trimesh (BatchedGlbHandle), which bakes vertex colors
-    into the GLB at construction time and has no runtime color update API.
-    To support it, color-only geoms would need to use add_batched_meshes_simple
-    (BatchedMeshHandle) instead, which exposes a batched_colors property. Deferred
-    for now.
-    """
-    # Group geoms by (body_id, group_id).
-    body_group_geoms: dict[tuple[int, int], list[int]] = {}
-
-    for i in range(self.mj_model.ngeom):
-      body_id = self.mj_model.geom_bodyid[i]
-
-      # Skip fixed world geometry.
-      if is_fixed_body(self.mj_model, body_id):
-        continue
-
-      geom_group = self.mj_model.geom_group[i]
-      key = (body_id, geom_group)
-
-      if key not in body_group_geoms:
-        body_group_geoms[key] = []
-      body_group_geoms[key].append(i)
-
-    # Create handles for each (body, group, sub) combination.
-    # Within each (body, group), split geoms by visual compatibility so that
-    # textured and color-only meshes are never concatenated together.
-    with self.server.atomic():
-      for (body_id, group_id), geom_indices in body_group_geoms.items():
-        body_name = get_body_name(self.mj_model, body_id)
-        subgroups = group_geoms_by_visual_compat(self.mj_model, geom_indices)
-        visible = group_id < 6 and self.geom_groups_visible[group_id]
-
-        for sub_idx, sub_geom_ids in enumerate(subgroups):
-          mesh = merge_geoms(self.mj_model, sub_geom_ids)
-          lod_ratio = 1000.0 / mesh.vertices.shape[0]
-
-          suffix = f"/sub{sub_idx}" if len(subgroups) > 1 else ""
-          handle = self.server.scene.add_batched_meshes_trimesh(
-            f"/bodies/{body_name}/group{group_id}{suffix}",
-            mesh,
-            batched_wxyzs=np.array([1.0, 0.0, 0.0, 0.0])[None].repeat(
-              self.num_envs, axis=0
-            ),
-            batched_positions=np.array([0.0, 0.0, 0.0])[None].repeat(
-              self.num_envs, axis=0
-            ),
-            lod=((2.0, lod_ratio),) if lod_ratio < 0.5 else "off",
-            visible=visible,
-          )
-          self.mesh_handles_by_group[(body_id, group_id, sub_idx)] = handle
-
-  def _add_fixed_sites(self) -> None:
-    """Add fixed site geometry to the scene as static nodes."""
-    # Group fixed body sites by (body_id, group_id).
-    body_group_sites: dict[tuple[int, int], list[int]] = {}
-    for site_id in range(self.mj_model.nsite):
-      body_id = self.mj_model.site_bodyid[site_id]
-      if not is_fixed_body(self.mj_model, body_id):
-        continue
-      group_id = int(self.mj_model.site_group[site_id])
-      body_group_sites.setdefault((body_id, group_id), []).append(site_id)
-
-    for (body_id, group_id), site_ids in body_group_sites.items():
-      body_name = get_body_name(self.mj_model, body_id)
-      mesh = merge_sites(self.mj_model, site_ids)
-      visible = group_id < 6 and self.site_groups_visible[group_id]
-      handle = self.server.scene.add_mesh_trimesh(
-        f"/fixed_bodies/{body_name}/sites_group{group_id}",
-        mesh,
-        cast_shadow=False,
-        receive_shadow=0.2,
-        position=self.mj_model.body(body_id).pos,
-        wxyz=self.mj_model.body(body_id).quat,
-        visible=visible,
-      )
-      self._fixed_site_handles[(body_id, group_id)] = handle
-
-  def _create_site_handles_by_group(self) -> None:
-    """Create site handles for each site group to allow independent toggling."""
-    # Group sites by (body_id, group_id).
-    body_group_sites: dict[tuple[int, int], list[int]] = {}
-    for site_id in range(self.mj_model.nsite):
-      body_id = self.mj_model.site_bodyid[site_id]
-      if is_fixed_body(self.mj_model, body_id):
-        continue
-      group_id = int(self.mj_model.site_group[site_id])
-      body_group_sites.setdefault((body_id, group_id), []).append(site_id)
-
-    with self.server.atomic():
-      for (body_id, group_id), site_ids in body_group_sites.items():
-        body_name = get_body_name(self.mj_model, body_id)
-        mesh = merge_sites(self.mj_model, site_ids)
-        visible = group_id < 6 and self.site_groups_visible[group_id]
-        handle = self.server.scene.add_batched_meshes_trimesh(
-          f"/bodies/{body_name}/sites_group{group_id}",
-          mesh,
-          batched_wxyzs=np.array([1.0, 0.0, 0.0, 0.0])[None].repeat(
-            self.num_envs, axis=0
-          ),
-          batched_positions=np.array([0.0, 0.0, 0.0])[None].repeat(
-            self.num_envs, axis=0
-          ),
-          lod="off",
-          visible=visible,
-        )
-        self.site_handles_by_group[(body_id, group_id)] = handle
-
-  def _extract_contacts_from_mjdata(self, mj_data: mujoco.MjData) -> list[_Contact]:
-    """Extract contact data from given MuJoCo data."""
-
-    def make_contact(i: int) -> _Contact:
-      con, force = mj_data.contact[i], np.zeros(6)
-      mujoco.mj_contactForce(self.mj_model, mj_data, i, force)
-      return _Contact(
-        pos=con.pos.copy(),
-        frame=con.frame.copy().reshape(3, 3),
-        force=force[:3].copy(),
-        dist=con.dist,
-        included=con.efc_address >= 0,
-      )
-
-    return [make_contact(i) for i in range(mj_data.ncon)]
-
-  def _update_contact_visualization(
-    self, contacts: list[_Contact], scene_offset: np.ndarray
-  ) -> None:
-    """Update contact point and force visualization."""
-    contact_points: list[_ContactPointVisual] = []
-    contact_forces: list[_ContactForceVisual] = []
-
-    meansize = self.meansize_override or self.mj_model.stat.meansize
-
-    for contact in contacts:
-      if not contact.included:
-        continue
-
-      # Transform force from contact frame to world frame.
-      force_world = contact.frame.T @ contact.force
-      force_mag = np.linalg.norm(force_world)
-
-      # Contact point visualization (cylinder).
-      if self.show_contact_points:
-        contact_points.append(
-          _ContactPointVisual(
-            position=contact.pos + scene_offset,
-            orientation=vtf.SO3.from_matrix(
-              rotation_matrix_from_vectors(np.array([0, 0, 1]), contact.frame[0, :])
-            ).wxyz,
-            scale=np.array(
-              [
-                self.mj_model.vis.scale.contactwidth * meansize,
-                self.mj_model.vis.scale.contactwidth * meansize,
-                self.mj_model.vis.scale.contactheight * meansize,
-              ]
-            ),
-          )
-        )
-
-      # Contact force visualization (arrow shaft + head).
-      if self.show_contact_forces and force_mag > 1e-6:
-        force_dir = force_world / force_mag
-        arrow_length = (
-          force_mag * (self.mj_model.vis.map.force / self.mj_model.stat.meanmass)
-          if self.mj_model.stat.meanmass > 0
-          else force_mag
-        )
-        arrow_width = self.mj_model.vis.scale.forcewidth * meansize
-        force_quat = vtf.SO3.from_matrix(
-          rotation_matrix_from_vectors(np.array([0, 0, 1]), force_dir)
-        ).wxyz
-
-        contact_forces.append(
-          _ContactForceVisual(
-            shaft_position=contact.pos + scene_offset,
-            shaft_orientation=force_quat,
-            shaft_scale=np.array([arrow_width, arrow_width, arrow_length]),
-            head_position=contact.pos + scene_offset + force_dir * arrow_length,
-            head_orientation=force_quat,
-            head_scale=np.array([arrow_width, arrow_width, arrow_width]),
-          )
-        )
-
-    # Update or create contact point handle.
-    if contact_points:
-      positions = np.array([p.position for p in contact_points], dtype=np.float32)
-      orientations = np.array([p.orientation for p in contact_points], dtype=np.float32)
-      scales = np.array([p.scale for p in contact_points], dtype=np.float32)
-      if self.contact_point_handle is None:
-        mesh = trimesh.creation.cylinder(radius=1.0, height=1.0)
-        self.contact_point_handle = self.server.scene.add_batched_meshes_simple(
-          "/contacts/points",
-          mesh.vertices,
-          mesh.faces,
-          batched_wxyzs=orientations,
-          batched_positions=positions,
-          batched_scales=scales,
-          batched_colors=np.array(self.contact_point_color, dtype=np.uint8),
-          opacity=0.8,
-          lod="off",
-          cast_shadow=False,
-          receive_shadow=False,
-        )
-      self.contact_point_handle.batched_positions = positions
-      self.contact_point_handle.batched_wxyzs = orientations
-      self.contact_point_handle.batched_scales = scales
-      self.contact_point_handle.visible = True
-    elif self.contact_point_handle is not None:
-      self.contact_point_handle.visible = False
-
-    # Update or create contact force handles (shaft and head separately).
-    if contact_forces:
-      shaft_positions = np.array(
-        [f.shaft_position for f in contact_forces], dtype=np.float32
-      )
-      shaft_orientations = np.array(
-        [f.shaft_orientation for f in contact_forces], dtype=np.float32
-      )
-      shaft_scales = np.array([f.shaft_scale for f in contact_forces], dtype=np.float32)
-      head_positions = np.array(
-        [f.head_position for f in contact_forces], dtype=np.float32
-      )
-      head_orientations = np.array(
-        [f.head_orientation for f in contact_forces], dtype=np.float32
-      )
-      head_scales = np.array([f.head_scale for f in contact_forces], dtype=np.float32)
-      if self.contact_force_shaft_handle is None:
-        shaft_mesh = trimesh.creation.cylinder(radius=0.4, height=1.0)
-        shaft_mesh.apply_translation([0, 0, 0.5])
-        self.contact_force_shaft_handle = self.server.scene.add_batched_meshes_simple(
-          "/contacts/forces/shaft",
-          shaft_mesh.vertices,
-          shaft_mesh.faces,
-          batched_wxyzs=shaft_orientations,
-          batched_positions=shaft_positions,
-          batched_scales=shaft_scales,
-          batched_colors=np.array(self.contact_force_color, dtype=np.uint8),
-          opacity=0.8,
-          lod="off",
-          cast_shadow=False,
-          receive_shadow=False,
-        )
-        head_mesh = trimesh.creation.cone(radius=1.0, height=1.0, sections=8)
-        self.contact_force_head_handle = self.server.scene.add_batched_meshes_simple(
-          "/contacts/forces/head",
-          head_mesh.vertices,
-          head_mesh.faces,
-          batched_wxyzs=head_orientations,
-          batched_positions=head_positions,
-          batched_scales=head_scales,
-          batched_colors=np.array(self.contact_force_color, dtype=np.uint8),
-          opacity=0.8,
-          lod="off",
-          cast_shadow=False,
-          receive_shadow=False,
-        )
-      assert self.contact_force_shaft_handle is not None
-      assert self.contact_force_head_handle is not None
-      self.contact_force_shaft_handle.batched_positions = shaft_positions
-      self.contact_force_shaft_handle.batched_wxyzs = shaft_orientations
-      self.contact_force_shaft_handle.batched_scales = shaft_scales
-      self.contact_force_shaft_handle.visible = True
-      self.contact_force_head_handle.batched_positions = head_positions
-      self.contact_force_head_handle.batched_wxyzs = head_orientations
-      self.contact_force_head_handle.batched_scales = head_scales
-      self.contact_force_head_handle.visible = True
-    elif (
-      self.contact_force_shaft_handle is not None
-      and self.contact_force_head_handle is not None
-    ):
-      self.contact_force_shaft_handle.visible = (
-        self.contact_force_head_handle.visible
-      ) = False
-
-  # ============================================================================
-  # DebugVisualizer Protocol Implementation
-  # ============================================================================
-
-  @property
-  @override
-  def meansize(self) -> float:
-    return self.meansize_override or self.mj_model.stat.meansize
+  # DebugVisualizer ABC implementation.
 
   @override
   def add_arrow(
@@ -1080,27 +853,12 @@ class ViserMujocoScene(DebugVisualizer):
     width: float = 0.015,
     label: str | None = None,
   ) -> None:
-    """Queue an arrow for batched rendering.
-
-    Arrows are not rendered immediately but queued and rendered together
-    in the next update() call for efficiency.
-    """
     if not self.debug_visualization_enabled:
       return
-
-    del label  # Unused.
-    if isinstance(start, torch.Tensor):
-      start = start.cpu().numpy()
-    if isinstance(end, torch.Tensor):
-      end = end.cpu().numpy()
-
-    direction = end - start
-    length = np.linalg.norm(direction)
-
-    if length < 1e-6:
+    del label
+    start, end = _to_numpy(start), _to_numpy(end)
+    if np.linalg.norm(end - start) < 1e-6:
       return
-
-    # Queue the arrow for batched rendering (without scene offset - applied during sync)
     self._queued_arrows.append((start, end, color, width))
 
   @override
@@ -1113,33 +871,11 @@ class ViserMujocoScene(DebugVisualizer):
     alpha: float = 0.5,
     label: str | None = None,
   ) -> None:
-    """Queue a ghost mesh for batched rendering.
-
-    Ghosts are not rendered immediately but queued and rendered together
-    in the next update() call for efficiency.
-
-    Args:
-      qpos: Joint positions for the ghost pose
-      model: MuJoCo model with pre-configured appearance (geom_rgba for colors)
-      mocap_pos: Optional mocap position(s) for fixed-base entities
-      mocap_quat: Optional mocap quaternion(s) for fixed-base entities
-      alpha: Transparency override
-      label: Optional label for this ghost (used to differentiate multiple ghosts)
-    """
     if not self.debug_visualization_enabled:
       return
-
-    if isinstance(qpos, torch.Tensor):
-      qpos = qpos.cpu().numpy()
-    if isinstance(mocap_pos, torch.Tensor):
-      mocap_pos = mocap_pos.cpu().numpy()
-    if isinstance(mocap_quat, torch.Tensor):
-      mocap_quat = mocap_quat.cpu().numpy()
-
-    # Use label to differentiate ghosts (e.g., for different environments)
-    ghost_label = label if label else f"env_{self.env_idx}"
-
-    # Queue the ghost for batched rendering
+    qpos = _to_numpy(qpos)
+    mocap_pos = _to_numpy(mocap_pos) if mocap_pos is not None else None
+    mocap_quat = _to_numpy(mocap_quat) if mocap_quat is not None else None
     self._queued_ghosts.append(
       (
         qpos.copy(),
@@ -1147,7 +883,7 @@ class ViserMujocoScene(DebugVisualizer):
         np.asarray(mocap_pos).copy() if mocap_pos is not None else None,
         np.asarray(mocap_quat).copy() if mocap_quat is not None else None,
         alpha,
-        ghost_label,
+        label or f"env_{self.env_idx}",
       )
     )
 
@@ -1160,46 +896,21 @@ class ViserMujocoScene(DebugVisualizer):
     label: str | None = None,
     axis_radius: float = 0.01,
     alpha: float = 1.0,
-    axis_colors: tuple[tuple[float, float, float], ...] | None = None,
+    axis_colors: (tuple[tuple[float, float, float], ...] | None) = None,
   ) -> None:
-    """Add a coordinate frame visualization with RGB-colored axes.
-
-    This implementation reuses add_arrow to draw the three axis arrows.
-
-    Args:
-      position: Position of the frame origin (3D vector)
-      rotation_matrix: Rotation matrix (3x3)
-      scale: Scale/length of the axis arrows
-      label: Optional label for this frame.
-      axis_radius: Radius of the axis arrows.
-      alpha: Opacity for all axes (0=transparent, 1=opaque). Note: This implementation
-        does not support per-arrow transparency. All arrows in the scene will share
-        the same alpha value.
-      axis_colors: Optional tuple of 3 RGB colors for X, Y, Z axes. If None, uses
-        default RGB coloring (X=red, Y=green, Z=blue).
-    """
     if not self.debug_visualization_enabled:
       return
-
-    del label  # Unused.
-
-    if isinstance(position, torch.Tensor):
-      position = position.cpu().numpy()
-    if isinstance(rotation_matrix, torch.Tensor):
-      rotation_matrix = rotation_matrix.cpu().numpy()
-
-    default_colors = [(0.9, 0, 0), (0, 0.9, 0.0), (0.0, 0.0, 0.9)]
-    colors = axis_colors if axis_colors is not None else default_colors
-
+    del label
+    position = _to_numpy(position)
+    rotation_matrix = _to_numpy(rotation_matrix)
+    colors = axis_colors or [(0.9, 0, 0), (0, 0.9, 0), (0, 0, 0.9)]
     for axis_idx in range(3):
-      axis_direction = rotation_matrix[:, axis_idx]
-      end_position = position + axis_direction * scale
+      end = position + rotation_matrix[:, axis_idx] * scale
       rgb = colors[axis_idx]
-      color_rgba = (rgb[0], rgb[1], rgb[2], alpha)
       self.add_arrow(
         start=position,
-        end=end_position,
-        color=color_rgba,
+        end=end,
+        color=(rgb[0], rgb[1], rgb[2], alpha),
         width=axis_radius,
       )
 
@@ -1211,26 +922,10 @@ class ViserMujocoScene(DebugVisualizer):
     color: tuple[float, float, float, float],
     label: str | None = None,
   ) -> None:
-    """Queue a sphere for batched rendering.
-
-    Spheres are not rendered immediately but queued and rendered together
-    in the next update() call for efficiency.
-
-    Args:
-      center: Center position (3D vector).
-      radius: Sphere radius.
-      color: RGBA color (values 0-1).
-      label: Optional label for this sphere.
-    """
     if not self.debug_visualization_enabled:
       return
-
-    del label  # Unused.
-    if isinstance(center, torch.Tensor):
-      center = center.cpu().numpy()
-
-    # Queue the sphere for batched rendering
-    self._queued_spheres.append((center.copy(), radius, color))
+    del label
+    self._queued_spheres.append((_to_numpy(center).copy(), radius, color))
 
   @override
   def add_cylinder(
@@ -1241,28 +936,10 @@ class ViserMujocoScene(DebugVisualizer):
     color: tuple[float, float, float, float],
     label: str | None = None,
   ) -> None:
-    """Queue a cylinder for batched rendering.
-
-    Cylinders are not rendered immediately but queued and rendered together
-    in the next update() call for efficiency.
-
-    Args:
-      start: Bottom center position (3D vector).
-      end: Top center position (3D vector).
-      radius: Cylinder radius.
-      color: RGBA color (values 0-1).
-      label: Optional label for this cylinder.
-    """
     if not self.debug_visualization_enabled:
       return
-
-    del label  # Unused.
-    if isinstance(start, torch.Tensor):
-      start = start.cpu().numpy()
-    if isinstance(end, torch.Tensor):
-      end = end.cpu().numpy()
-
-    # Queue the cylinder for batched rendering
+    del label
+    start, end = _to_numpy(start), _to_numpy(end)
     self._queued_cylinders.append((start.copy(), end.copy(), radius, color))
 
   @override
@@ -1274,466 +951,255 @@ class ViserMujocoScene(DebugVisualizer):
     color: tuple[float, float, float, float],
     label: str | None = None,
   ) -> None:
-    """Queue an ellipsoid for batched rendering."""
     if not self.debug_visualization_enabled:
       return
-
-    del label  # Unused.
-    if isinstance(center, torch.Tensor):
-      center = center.cpu().numpy()
-    if isinstance(size, torch.Tensor):
-      size = size.cpu().numpy()
-    if isinstance(mat, torch.Tensor):
-      mat = mat.cpu().numpy()
-
-    mat = np.asarray(mat, dtype=np.float32).reshape(3, 3)
+    del label
     self._queued_ellipsoids.append(
       (
-        np.asarray(center, dtype=np.float32).copy(),
-        np.asarray(size, dtype=np.float32).copy(),
-        mat.copy(),
+        np.asarray(_to_numpy(center), dtype=np.float32).copy(),
+        np.asarray(_to_numpy(size), dtype=np.float32).copy(),
+        np.asarray(_to_numpy(mat), dtype=np.float32).reshape(3, 3).copy(),
+        color,
+      )
+    )
+
+  @override
+  def add_box(
+    self,
+    center: np.ndarray | torch.Tensor,
+    size: np.ndarray | torch.Tensor,
+    mat: np.ndarray | torch.Tensor,
+    color: tuple[float, float, float, float],
+    label: str | None = None,
+  ) -> None:
+    if not self.debug_visualization_enabled:
+      return
+    del label
+    self._queued_boxes.append(
+      (
+        np.asarray(_to_numpy(center), dtype=np.float32).copy(),
+        np.asarray(_to_numpy(size), dtype=np.float32).copy(),
+        np.asarray(_to_numpy(mat), dtype=np.float32).reshape(3, 3).copy(),
         color,
       )
     )
 
   @override
   def clear(self) -> None:
-    """Clear all debug visualizations.
-
-    Clears the arrow, sphere, cylinder, and ghost queues. Batched mesh handles
-    are kept and updated in sync methods for efficiency.
-    """
+    """Clear all debug visualization queues."""
     self._queued_arrows.clear()
     self._queued_spheres.clear()
     self._queued_cylinders.clear()
     self._queued_ellipsoids.clear()
+    self._queued_boxes.clear()
     self._queued_ghosts.clear()
 
   def clear_debug_all(self) -> None:
-    """Clear all debug visualizations including ghosts.
-
-    Called when switching to a different environment or disabling debug visualization.
-    """
+    """Clear all debug visualizations including handles."""
     self.clear()
-
-    # Remove arrow meshes
-    if self._arrow_shaft_handle is not None:
-      self._arrow_shaft_handle.remove()
-      self._arrow_shaft_handle = None
-    if self._arrow_head_handle is not None:
-      self._arrow_head_handle.remove()
-      self._arrow_head_handle = None
-
-    # Remove sphere meshes
-    if self._sphere_handle is not None:
-      self._sphere_handle.remove()
-      self._sphere_handle = None
-
-    # Remove cylinder meshes
-    if self._cylinder_handle is not None:
-      self._cylinder_handle.remove()
-      self._cylinder_handle = None
-
-    # Remove ellipsoid meshes
-    if self._ellipsoid_handle is not None:
-      self._ellipsoid_handle.remove()
-      self._ellipsoid_handle = None
-
-    # Hide ghost meshes (retain handles to avoid recreate hitch on re-enable)
-    for handle in self._ghost_handles_batched.values():
+    for prim in self._all_primitives:
+      prim.remove()
+    for handle in self._ghost_handles.values():
       handle.visible = False
 
-  def _create_geom_mesh_from_model(
-    self, mj_model: mujoco.MjModel, geom_id: int
-  ) -> trimesh.Trimesh | None:
-    """Create a trimesh from a MuJoCo geom using the specified model.
+  # Debug sync.
 
-    Args:
-      mj_model: MuJoCo model containing geom definition
-      geom_id: Index of the geom to create mesh for
-
-    Returns:
-      Trimesh representation of the geom, or None if unsupported type
-    """
-    geom_type = mj_model.geom_type[geom_id]
-
-    if geom_type == mjtGeom.mjGEOM_MESH:
-      return mujoco_mesh_to_trimesh(mj_model, geom_id, verbose=False)
-    else:
-      return create_primitive_mesh(mj_model, geom_id)
+  def _sync_debug_visualizations(self, scene_offset: np.ndarray) -> None:
+    if not self.debug_visualization_enabled:
+      return
+    self._scene_offset = scene_offset
+    self._sync_arrows()
+    self._sync_simple_primitives()
+    self._sync_ghosts()
 
   def _sync_arrows(self) -> None:
-    """Render all queued arrows using batched meshes.
-
-    This should be called after all debug visualizations have been queued
-    for the current frame.
-    """
-    if not self.debug_visualization_enabled:
-      return
-
     if not self._queued_arrows:
-      # Remove arrow meshes if no arrows to render
-      if self._arrow_shaft_handle is not None:
-        self._arrow_shaft_handle.remove()
-        self._arrow_shaft_handle = None
-      if self._arrow_head_handle is not None:
-        self._arrow_head_handle.remove()
-        self._arrow_head_handle = None
+      self._arrow_shafts.remove()
+      self._arrow_heads.remove()
       return
 
-    # Create arrow mesh components if needed (unit-sized base meshes)
-    if self._arrow_shaft_mesh is None:
-      # Unit cylinder: radius=1.0, height=1.0
-      self._arrow_shaft_mesh = trimesh.creation.cylinder(radius=1.0, height=1.0)
-      self._arrow_shaft_mesh.apply_translation(np.array([0, 0, 0.5]))  # Center at z=0.5
+    n = len(self._queued_arrows)
+    shaft_pos = np.zeros((n, 3), dtype=np.float32)
+    shaft_wxyz = np.zeros((n, 4), dtype=np.float32)
+    shaft_scale = np.zeros((n, 3), dtype=np.float32)
+    shaft_col = np.zeros((n, 3), dtype=np.uint8)
+    head_pos = np.zeros((n, 3), dtype=np.float32)
+    head_wxyz = np.zeros((n, 4), dtype=np.float32)
+    head_scale = np.zeros((n, 3), dtype=np.float32)
+    head_col = np.zeros((n, 3), dtype=np.uint8)
 
-    if self._arrow_head_mesh is None:
-      # Unit cone: radius=2.0, height=1.0 (base at z=0, tip at z=1.0 by default)
-      head_width = 2.0
-      self._arrow_head_mesh = trimesh.creation.cone(radius=head_width, height=1.0)
-      # No translation needed - cone already has base at z=0
-
-    # Prepare batched data
-    num_arrows = len(self._queued_arrows)
-    shaft_positions = np.zeros((num_arrows, 3), dtype=np.float32)
-    shaft_wxyzs = np.zeros((num_arrows, 4), dtype=np.float32)
-    shaft_scales = np.zeros((num_arrows, 3), dtype=np.float32)
-    shaft_colors = np.zeros((num_arrows, 3), dtype=np.uint8)
-
-    head_positions = np.zeros((num_arrows, 3), dtype=np.float32)
-    head_wxyzs = np.zeros((num_arrows, 4), dtype=np.float32)
-    head_scales = np.zeros((num_arrows, 3), dtype=np.float32)
-    head_colors = np.zeros((num_arrows, 3), dtype=np.uint8)
-
-    z_axis = np.array([0, 0, 1])
-    shaft_length_ratio = 0.8
-    head_length_ratio = 0.2
-
-    # Apply scene offset to all arrows
     for i, (start, end, color, width) in enumerate(self._queued_arrows):
-      # Apply scene offset
-      start_offset = start + self._scene_offset
-      end_offset = end + self._scene_offset
+      s = start + self._scene_offset
+      e = end + self._scene_offset
+      d = e - s
+      length = np.linalg.norm(d)
+      d = d / length
+      q = _rotation_quat(_Z_AXIS, d)
+      c = _color_uint8(color)
 
-      direction = end_offset - start_offset
-      length = np.linalg.norm(direction)
-      direction = direction / length
+      shaft_len = 0.8 * length
+      shaft_pos[i] = s
+      shaft_wxyz[i] = q
+      shaft_scale[i] = [width, width, shaft_len]
+      shaft_col[i] = c
 
-      rotation_quat = rotation_quat_from_vectors(z_axis, direction)
+      head_pos[i] = s + d * shaft_len
+      head_wxyz[i] = q
+      head_scale[i] = [width, width, 0.2 * length]
+      head_col[i] = c
 
-      # Shaft: scale width in XY, length in Z
-      shaft_length = shaft_length_ratio * length
-      shaft_positions[i] = start_offset
-      shaft_wxyzs[i] = rotation_quat
-      shaft_scales[i] = [width, width, shaft_length]  # Per-axis scale
-      shaft_colors[i] = (np.array(color[:3]) * 255).astype(np.uint8)
-
-      # Head: position at end of shaft
-      # The cone has its base at z=0, so after scaling by head_length,
-      # the base is still at z=0 in local coords
-      # We want the base at the end of the shaft (at shaft_length)
-      head_length = head_length_ratio * length
-      head_position = start_offset + direction * shaft_length
-      head_positions[i] = head_position
-      head_wxyzs[i] = rotation_quat
-      head_scales[i] = [width, width, head_length]  # Per-axis scale
-      head_colors[i] = (np.array(color[:3]) * 255).astype(np.uint8)
-
-    # Check if we need to recreate handles (number of arrows changed)
-    needs_recreation = (
-      self._arrow_shaft_handle is None
-      or self._arrow_head_handle is None
-      or len(shaft_positions) != len(self._arrow_shaft_handle.batched_positions)
+    self._arrow_shafts.sync(
+      self.server,
+      self.env_idx,
+      shaft_pos,
+      shaft_wxyz,
+      shaft_scale,
+      shaft_col,
+    )
+    self._arrow_heads.sync(
+      self.server,
+      self.env_idx,
+      head_pos,
+      head_wxyz,
+      head_scale,
+      head_col,
     )
 
-    if needs_recreation:
-      # Remove old handles
-      if self._arrow_shaft_handle is not None:
-        self._arrow_shaft_handle.remove()
-      if self._arrow_head_handle is not None:
-        self._arrow_head_handle.remove()
-
-      # Create new batched meshes
-      self._arrow_shaft_handle = self.server.scene.add_batched_meshes_simple(
-        f"/debug/env_{self.env_idx}/arrow_shafts",
-        self._arrow_shaft_mesh.vertices,
-        self._arrow_shaft_mesh.faces,
-        batched_wxyzs=shaft_wxyzs,
-        batched_positions=shaft_positions,
-        batched_scales=shaft_scales,
-        batched_colors=shaft_colors,
-        cast_shadow=False,
-        receive_shadow=False,
-      )
-
-      self._arrow_head_handle = self.server.scene.add_batched_meshes_simple(
-        f"/debug/env_{self.env_idx}/arrow_heads",
-        self._arrow_head_mesh.vertices,
-        self._arrow_head_mesh.faces,
-        batched_wxyzs=head_wxyzs,
-        batched_positions=head_positions,
-        batched_scales=head_scales,
-        batched_colors=head_colors,
-        cast_shadow=False,
-        receive_shadow=False,
-      )
-    else:
-      # Update existing handles (guaranteed to exist by needs_recreation check)
-      assert self._arrow_shaft_handle is not None
-      assert self._arrow_head_handle is not None
-
-      self._arrow_shaft_handle.batched_positions = shaft_positions
-      self._arrow_shaft_handle.batched_wxyzs = shaft_wxyzs
-      self._arrow_shaft_handle.batched_scales = shaft_scales
-      self._arrow_shaft_handle.batched_colors = shaft_colors
-
-      self._arrow_head_handle.batched_positions = head_positions
-      self._arrow_head_handle.batched_wxyzs = head_wxyzs
-      self._arrow_head_handle.batched_scales = head_scales
-      self._arrow_head_handle.batched_colors = head_colors
+  def _sync_simple_primitives(self) -> None:
+    self._sync_spheres()
+    self._sync_cylinders()
+    self._sync_ellipsoids()
+    self._sync_boxes()
 
   def _sync_spheres(self) -> None:
-    """Render all queued spheres using batched meshes.
-
-    This should be called after all debug visualizations have been queued
-    for the current frame.
-    """
-    if not self.debug_visualization_enabled:
-      return
-
     if not self._queued_spheres:
-      # Remove sphere mesh if no spheres to render
-      if self._sphere_handle is not None:
-        self._sphere_handle.remove()
-        self._sphere_handle = None
+      self._spheres.remove()
       return
-
-    # Create sphere mesh if needed (unit sphere)
-    if self._sphere_mesh is None:
-      self._sphere_mesh = trimesh.creation.icosphere(subdivisions=2, radius=1.0)
-
-    # Prepare batched data
-    num_spheres = len(self._queued_spheres)
-    positions = np.zeros((num_spheres, 3), dtype=np.float32)
-    scales = np.zeros((num_spheres, 3), dtype=np.float32)
-    colors = np.zeros((num_spheres, 3), dtype=np.uint8)
-    opacities = np.zeros(num_spheres, dtype=np.float32)
-
-    # Apply scene offset to all spheres
+    n = len(self._queued_spheres)
+    positions = np.zeros((n, 3), dtype=np.float32)
+    wxyzs = np.tile(_IDENTITY_QUAT, (n, 1)).astype(np.float32)
+    scales = np.zeros((n, 3), dtype=np.float32)
+    colors = np.zeros((n, 3), dtype=np.uint8)
+    opacity = 1.0
     for i, (center, radius, color) in enumerate(self._queued_spheres):
       positions[i] = center + self._scene_offset
-      scales[i] = [radius, radius, radius]
-      colors[i] = (np.array(color[:3]) * 255).astype(np.uint8)
-      opacities[i] = color[3]
-
-    # Check if we need to recreate handle (number of spheres changed)
-    needs_recreation = self._sphere_handle is None or len(positions) != len(
-      self._sphere_handle.batched_positions
+      scales[i] = radius
+      colors[i] = _color_uint8(color)
+      opacity = color[3]
+    self._spheres.sync(
+      self.server,
+      self.env_idx,
+      positions,
+      wxyzs,
+      scales,
+      colors,
+      opacity,
     )
-
-    if needs_recreation:
-      # Remove old handle
-      if self._sphere_handle is not None:
-        self._sphere_handle.remove()
-
-      # Create new batched mesh
-      # Note: Viser's batched meshes don't support per-instance opacity,
-      # so we use the first sphere's opacity for all spheres
-      self._sphere_handle = self.server.scene.add_batched_meshes_simple(
-        f"/debug/env_{self.env_idx}/spheres",
-        self._sphere_mesh.vertices,
-        self._sphere_mesh.faces,
-        batched_wxyzs=np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (num_spheres, 1)),
-        batched_positions=positions,
-        batched_scales=scales,
-        batched_colors=colors,
-        opacity=opacities[0],  # Use first sphere's opacity
-        cast_shadow=False,
-        receive_shadow=False,
-      )
-    else:
-      # Update existing handle
-      assert self._sphere_handle is not None
-      self._sphere_handle.batched_positions = positions
-      self._sphere_handle.batched_scales = scales
-      self._sphere_handle.batched_colors = colors
 
   def _sync_cylinders(self) -> None:
-    """Render all queued cylinders using batched meshes.
-
-    This should be called after all debug visualizations have been queued
-    for the current frame.
-    """
-    if not self.debug_visualization_enabled:
-      return
-
     if not self._queued_cylinders:
-      # Remove cylinder mesh if no cylinders to render
-      if self._cylinder_handle is not None:
-        self._cylinder_handle.remove()
-        self._cylinder_handle = None
+      self._cylinders.remove()
       return
-
-    # Create cylinder mesh if needed (unit cylinder: radius=1, height=1)
-    if self._cylinder_mesh is None:
-      self._cylinder_mesh = trimesh.creation.cylinder(radius=1.0, height=1.0)
-
-    # Prepare batched data
-    num_cylinders = len(self._queued_cylinders)
-    positions = np.zeros((num_cylinders, 3), dtype=np.float32)
-    wxyzs = np.zeros((num_cylinders, 4), dtype=np.float32)
-    scales = np.zeros((num_cylinders, 3), dtype=np.float32)
-    colors = np.zeros((num_cylinders, 3), dtype=np.uint8)
-    opacities = np.zeros(num_cylinders, dtype=np.float32)
-
-    z_axis = np.array([0, 0, 1])
-
-    # Apply scene offset to all cylinders
+    n = len(self._queued_cylinders)
+    positions = np.zeros((n, 3), dtype=np.float32)
+    wxyzs = np.zeros((n, 4), dtype=np.float32)
+    scales = np.zeros((n, 3), dtype=np.float32)
+    colors = np.zeros((n, 3), dtype=np.uint8)
+    opacity = 1.0
     for i, (start, end, radius, color) in enumerate(self._queued_cylinders):
-      # Apply scene offset
-      start_offset = start + self._scene_offset
-      end_offset = end + self._scene_offset
-
-      direction = end_offset - start_offset
-      length = np.linalg.norm(direction)
-
+      s = start + self._scene_offset
+      e = end + self._scene_offset
+      d = e - s
+      length = np.linalg.norm(d)
       if length < 1e-6:
-        # Degenerate cylinder - use identity rotation and zero scale
-        positions[i] = start_offset
-        wxyzs[i] = [1.0, 0.0, 0.0, 0.0]
-        scales[i] = [0.0, 0.0, 0.0]
+        positions[i] = s
+        wxyzs[i] = _IDENTITY_QUAT
       else:
-        direction = direction / length
-        rotation_quat = rotation_quat_from_vectors(z_axis, direction)
-
-        # Position at midpoint
-        positions[i] = (start_offset + end_offset) / 2
-        wxyzs[i] = rotation_quat
+        positions[i] = (s + e) / 2
+        wxyzs[i] = _rotation_quat(_Z_AXIS, d / length)
         scales[i] = [radius, radius, length]
-
-      colors[i] = (np.array(color[:3]) * 255).astype(np.uint8)
-      opacities[i] = color[3]
-
-    # Check if we need to recreate handle (number of cylinders changed)
-    needs_recreation = self._cylinder_handle is None or len(positions) != len(
-      self._cylinder_handle.batched_positions
+      colors[i] = _color_uint8(color)
+      opacity = color[3]
+    self._cylinders.sync(
+      self.server,
+      self.env_idx,
+      positions,
+      wxyzs,
+      scales,
+      colors,
+      opacity,
     )
 
-    if needs_recreation:
-      # Remove old handle
-      if self._cylinder_handle is not None:
-        self._cylinder_handle.remove()
-
-      # Create new batched mesh
-      # Note: Viser's batched meshes don't support per-instance opacity,
-      # so we use the first cylinder's opacity for all cylinders
-      self._cylinder_handle = self.server.scene.add_batched_meshes_simple(
-        f"/debug/env_{self.env_idx}/cylinders",
-        self._cylinder_mesh.vertices,
-        self._cylinder_mesh.faces,
-        batched_wxyzs=wxyzs,
-        batched_positions=positions,
-        batched_scales=scales,
-        batched_colors=colors,
-        opacity=opacities[0],  # Use first cylinder's opacity
-        cast_shadow=False,
-        receive_shadow=False,
-      )
-    else:
-      # Update existing handle
-      assert self._cylinder_handle is not None
-      self._cylinder_handle.batched_positions = positions
-      self._cylinder_handle.batched_wxyzs = wxyzs
-      self._cylinder_handle.batched_scales = scales
-      self._cylinder_handle.batched_colors = colors
-
   def _sync_ellipsoids(self) -> None:
-    """Render all queued ellipsoids using batched meshes."""
-    if not self.debug_visualization_enabled:
-      return
-
     if not self._queued_ellipsoids:
-      if self._ellipsoid_handle is not None:
-        self._ellipsoid_handle.remove()
-        self._ellipsoid_handle = None
+      self._ellipsoids.remove()
       return
-
-    if self._ellipsoid_mesh is None:
-      self._ellipsoid_mesh = trimesh.creation.icosphere(subdivisions=2, radius=1.0)
-
-    num_ellipsoids = len(self._queued_ellipsoids)
-    positions = np.zeros((num_ellipsoids, 3), dtype=np.float32)
-    wxyzs = np.zeros((num_ellipsoids, 4), dtype=np.float32)
-    scales = np.zeros((num_ellipsoids, 3), dtype=np.float32)
-    colors = np.zeros((num_ellipsoids, 3), dtype=np.uint8)
-    opacities = np.zeros(num_ellipsoids, dtype=np.float32)
-
+    n = len(self._queued_ellipsoids)
+    positions = np.zeros((n, 3), dtype=np.float32)
+    wxyzs = np.zeros((n, 4), dtype=np.float32)
+    scales = np.zeros((n, 3), dtype=np.float32)
+    colors = np.zeros((n, 3), dtype=np.uint8)
+    opacity = 1.0
     for i, (center, size, mat, color) in enumerate(self._queued_ellipsoids):
       positions[i] = center + self._scene_offset
       wxyzs[i] = vtf.SO3.from_matrix(mat).wxyz
       scales[i] = size
-      colors[i] = (np.array(color[:3]) * 255).astype(np.uint8)
-      opacities[i] = color[3]
-
-    needs_recreation = self._ellipsoid_handle is None or len(positions) != len(
-      self._ellipsoid_handle.batched_positions
+      colors[i] = _color_uint8(color)
+      opacity = color[3]
+    self._ellipsoids.sync(
+      self.server,
+      self.env_idx,
+      positions,
+      wxyzs,
+      scales,
+      colors,
+      opacity,
     )
 
-    if needs_recreation:
-      if self._ellipsoid_handle is not None:
-        self._ellipsoid_handle.remove()
-
-      self._ellipsoid_handle = self.server.scene.add_batched_meshes_simple(
-        f"/debug/env_{self.env_idx}/ellipsoids",
-        self._ellipsoid_mesh.vertices,
-        self._ellipsoid_mesh.faces,
-        batched_wxyzs=wxyzs,
-        batched_positions=positions,
-        batched_scales=scales,
-        batched_colors=colors,
-        opacity=opacities[0],
-        cast_shadow=False,
-        receive_shadow=False,
-      )
-    else:
-      assert self._ellipsoid_handle is not None
-      self._ellipsoid_handle.batched_positions = positions
-      self._ellipsoid_handle.batched_wxyzs = wxyzs
-      self._ellipsoid_handle.batched_scales = scales
-      self._ellipsoid_handle.batched_colors = colors
+  def _sync_boxes(self) -> None:
+    if not self._queued_boxes:
+      self._boxes.remove()
+      return
+    n = len(self._queued_boxes)
+    positions = np.zeros((n, 3), dtype=np.float32)
+    wxyzs = np.zeros((n, 4), dtype=np.float32)
+    scales = np.zeros((n, 3), dtype=np.float32)
+    colors = np.zeros((n, 3), dtype=np.uint8)
+    opacity = 1.0
+    for i, (center, size, mat, color) in enumerate(self._queued_boxes):
+      positions[i] = center + self._scene_offset
+      wxyzs[i] = vtf.SO3.from_matrix(mat).wxyz
+      scales[i] = size
+      colors[i] = _color_uint8(color)
+      opacity = color[3]
+    self._boxes.sync(
+      self.server,
+      self.env_idx,
+      positions,
+      wxyzs,
+      scales,
+      colors,
+      opacity,
+    )
 
   def _sync_ghosts(self) -> None:
-    """Render all queued ghosts using batched meshes.
-
-    This should be called after all debug visualizations have been queued
-    for the current frame. Creates one batched mesh handle per (model_hash, body_id)
-    combination, significantly reducing scene node count for multi-env rendering.
-    """
-    if not self.debug_visualization_enabled:
-      for handle in self._ghost_handles_batched.values():
+    """Render queued ghosts as one batched handle per (model, body)."""
+    if not self._queued_ghosts:
+      for handle in self._ghost_handles.values():
         handle.visible = False
       return
 
-    if not self._queued_ghosts:
-      # While paused, keep last ghost snapshot visible so toggling debug does not
-      # require stepping to repopulate queues. While running, empty queue means
-      # ghosts should disappear this frame.
-      for handle in self._ghost_handles_batched.values():
-        handle.visible = self.paused
-      return
-
-    # Group ghosts by (model_hash, body_id) -> list of (qpos, model, alpha, label)
-    # First, compute body transforms for each ghost
     body_data: dict[
-      tuple[int, int], list[tuple[np.ndarray, np.ndarray, np.ndarray]]
-    ] = {}  # (model_hash, body_id) -> [(position, wxyz, color_uint8), ...]
-    alpha_by_model: dict[int, float] = {}  # model_hash -> alpha
+      tuple[int, int],
+      list[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    ] = {}
+    alpha_by_model: dict[int, float] = {}
 
     for qpos, model, mocap_pos, mocap_quat, alpha, _label in self._queued_ghosts:
-      model_hash = hash((model.ngeom, model.nbody, model.nq))
-      alpha_by_model[model_hash] = alpha
+      model_id = id(model)
+      alpha_by_model[model_id] = alpha
 
-      # Forward kinematics
+      # Forward kinematics on the visualization-only MjData.
       self._viz_data.qpos[:] = qpos
       if mocap_pos is not None and model.nmocap > 0:
         if mocap_pos.ndim == 1:
@@ -1747,84 +1213,64 @@ class ViserMujocoScene(DebugVisualizer):
           self._viz_data.mocap_quat[:] = mocap_quat
       mujoco.mj_forward(model, self._viz_data)
 
-      # Group geoms by body (to get color and determine which bodies have visual geoms)
+      # Group visible ghost geoms by body.
       body_geoms: dict[int, list[int]] = {}
-      for i in range(model.ngeom):
-        body_id = model.geom_bodyid[i]
-        is_collision = model.geom_contype[i] != 0 or model.geom_conaffinity[i] != 0
-        if is_collision:
+      for gi in range(model.ngeom):
+        if model.geom_rgba[gi, 3] == 0:
           continue
-        if model.body_dofnum[body_id] == 0 and model.body_parentid[body_id] == 0:
+        bid = model.geom_bodyid[gi]
+        if model.body_dofnum[bid] == 0 and model.body_parentid[bid] == 0:
           continue
-        if body_id not in body_geoms:
-          body_geoms[body_id] = []
-        body_geoms[body_id].append(i)
+        body_geoms.setdefault(bid, []).append(gi)
 
-      # Collect body transforms
-      for body_id, geom_indices in body_geoms.items():
-        key = (model_hash, body_id)
-        if key not in body_data:
-          body_data[key] = []
+      for bid, bid_geom_ids in body_geoms.items():
+        key = (model_id, bid)
+        body_data.setdefault(key, []).append(
+          (
+            (self._viz_data.xpos[bid] + self._scene_offset).copy(),
+            vtf.SO3.from_matrix(self._viz_data.xmat[bid].reshape(3, 3)).wxyz.copy(),
+            (model.geom_rgba[bid_geom_ids[0]][:3] * 255).astype(np.uint8),
+          )
+        )
 
-        body_pos = self._viz_data.xpos[body_id] + self._scene_offset
-        body_quat = self._mat_to_quat(self._viz_data.xmat[body_id].reshape(3, 3))
-
-        # Extract color from first geom (convert RGBA 0-1 to RGB 0-255)
-        rgba = model.geom_rgba[geom_indices[0]].copy()
-        color_uint8 = (rgba[:3] * 255).astype(np.uint8)
-
-        body_data[key].append((body_pos.copy(), body_quat.copy(), color_uint8))
-
-        # Cache mesh if not already cached
-        if model_hash not in self._ghost_meshes:
-          self._ghost_meshes[model_hash] = {}
-        if body_id not in self._ghost_meshes[model_hash]:
+        # Cache combined mesh per (model, body).
+        by_model = self._ghost_meshes.setdefault(model_id, {})
+        if bid not in by_model:
           meshes = []
-          for geom_id in geom_indices:
-            mesh = self._create_geom_mesh_from_model(model, geom_id)
+          for gid in bid_geom_ids:
+            mesh = _create_geom_mesh(model, gid)
             if mesh is not None:
-              geom_pos = model.geom_pos[geom_id]
-              geom_quat = model.geom_quat[geom_id]
-              transform = np.eye(4)
-              transform[:3, :3] = vtf.SO3(geom_quat).as_matrix()
-              transform[:3, 3] = geom_pos
-              mesh.apply_transform(transform)
+              T = np.eye(4)
+              T[:3, :3] = vtf.SO3(model.geom_quat[gid]).as_matrix()
+              T[:3, 3] = model.geom_pos[gid]
+              mesh.apply_transform(T)
               meshes.append(mesh)
           if meshes:
-            combined_mesh = (
+            by_model[bid] = (
               meshes[0] if len(meshes) == 1 else trimesh.util.concatenate(meshes)
             )
-            self._ghost_meshes[model_hash][body_id] = combined_mesh
 
-    # Remove handles for bodies that are no longer present
-    keys_to_remove = set(self._ghost_handles_batched.keys()) - set(body_data.keys())
-    for key in keys_to_remove:
-      self._ghost_handles_batched[key].remove()
-      del self._ghost_handles_batched[key]
+    # Remove stale handles.
+    for key in set(self._ghost_handles) - set(body_data):
+      self._ghost_handles.pop(key).remove()
 
-    # Create/update batched mesh handles for each (model_hash, body_id)
-    for (model_hash, body_id), transforms in body_data.items():
-      if model_hash not in self._ghost_meshes:
-        continue
-      if body_id not in self._ghost_meshes[model_hash]:
+    # Create or update handles.
+    for (model_id, bid), transforms in body_data.items():
+      mesh = self._ghost_meshes.get(model_id, {}).get(bid)
+      if mesh is None:
         continue
 
-      combined_mesh = self._ghost_meshes[model_hash][body_id]
-
-      # Prepare batched arrays
       positions = np.array([t[0] for t in transforms], dtype=np.float32)
       wxyzs = np.array([t[1] for t in transforms], dtype=np.float32)
       colors = np.array([t[2] for t in transforms], dtype=np.uint8)
-      alpha = alpha_by_model.get(model_hash, 0.5)
+      alpha = alpha_by_model.get(model_id, 0.5)
+      key = (model_id, bid)
 
-      key = (model_hash, body_id)
-
-      # Create handle if missing; otherwise update in place.
-      if key not in self._ghost_handles_batched:
-        self._ghost_handles_batched[key] = self.server.scene.add_batched_meshes_simple(
-          f"/debug/ghosts/body_{body_id}_{model_hash}",
-          combined_mesh.vertices,
-          combined_mesh.faces,
+      if key not in self._ghost_handles:
+        self._ghost_handles[key] = self.server.scene.add_batched_meshes_simple(
+          f"/debug/ghosts/body_{bid}_{model_id}",
+          mesh.vertices,
+          mesh.faces,
           batched_wxyzs=wxyzs,
           batched_positions=positions,
           batched_colors=colors,
@@ -1833,9 +1279,7 @@ class ViserMujocoScene(DebugVisualizer):
           receive_shadow=False,
         )
       else:
-        # Update existing handle. Some viser versions allow dynamic batch sizes;
-        # if not, fallback to recreate for this key only.
-        handle = self._ghost_handles_batched[key]
+        handle = self._ghost_handles[key]
         try:
           handle.batched_positions = positions
           handle.batched_wxyzs = wxyzs
@@ -1843,21 +1287,23 @@ class ViserMujocoScene(DebugVisualizer):
           handle.visible = True
         except Exception:
           handle.remove()
-          self._ghost_handles_batched[key] = (
-            self.server.scene.add_batched_meshes_simple(
-              f"/debug/ghosts/body_{body_id}_{model_hash}",
-              combined_mesh.vertices,
-              combined_mesh.faces,
-              batched_wxyzs=wxyzs,
-              batched_positions=positions,
-              batched_colors=colors,
-              opacity=alpha,
-              cast_shadow=False,
-              receive_shadow=False,
-            )
+          self._ghost_handles[key] = self.server.scene.add_batched_meshes_simple(
+            f"/debug/ghosts/body_{bid}_{model_id}",
+            mesh.vertices,
+            mesh.faces,
+            batched_wxyzs=wxyzs,
+            batched_positions=positions,
+            batched_colors=colors,
+            opacity=alpha,
+            cast_shadow=False,
+            receive_shadow=False,
           )
 
-  @staticmethod
-  def _mat_to_quat(mat: np.ndarray) -> np.ndarray:
-    """Convert rotation matrix to quaternion (wxyz)."""
-    return vtf.SO3.from_matrix(mat).wxyz
+
+# Helpers.
+
+
+def _create_geom_mesh(mj_model: mujoco.MjModel, geom_id: int) -> trimesh.Trimesh | None:
+  if mj_model.geom_type[geom_id] == mjtGeom.mjGEOM_MESH:
+    return mujoco_mesh_to_trimesh(mj_model, geom_id)
+  return create_primitive_mesh(mj_model, geom_id)

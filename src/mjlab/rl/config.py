@@ -28,8 +28,14 @@ class RslRlModelCfg:
 
   ``None`` means deterministic output (use for critic).
   """
+  rnn_type: str | None = None
+  """RNN type ("lstm" or "gru"). When set, class_name should be "RNNModel"."""
+  rnn_hidden_dim: int = 256
+  """Hidden state dimension for the RNN."""
+  rnn_num_layers: int = 1
+  """Number of stacked RNN layers."""
   class_name: str = "MLPModel"
-  """Model class name resolved by RSL-RL (MLPModel or CNNModel)."""
+  """Model class name resolved by RSL-RL (MLPModel, CNNModel, or RNNModel)."""
 
 
 @dataclass
@@ -89,8 +95,9 @@ class RslRlBaseRunnerCfg:
   save_interval: int = 50
   """The number of iterations between saves."""
   experiment_name: str = "exp1"
-  """Directory name used to group runs under
-  ``logs/rsl_rl/{experiment_name}/``."""
+  """Directory name used to group runs under ``{log_root}/{experiment_name}/``.
+  The log root defaults to ``logs/rsl_rl`` and can be overridden with
+  ``--log-root`` on the CLI."""
   run_name: str = ""
   """Optional label appended to the timestamped run directory
   (e.g. ``2025-01-27_14-30-00_{run_name}``). Also becomes the

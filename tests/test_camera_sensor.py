@@ -328,6 +328,82 @@ def test_cam_intrinsic_dr_changes_rendered_image(device):
   assert torch.equal(after[1], baseline[1]), "Env 1 image changed unexpectedly"
 
 
+def test_camera_segmentation_shape(device):
+  """Segmentation data has correct shape [num_envs, height, width, 2]."""
+  cam_cfg = CameraSensorCfg(
+    name="test_cam",
+    camera_name="world/overhead_cam",
+    width=32,
+    height=24,
+    data_types=("segmentation",),
+  )
+  scene, sim = _make_scene_and_sim(device, sensors=(cam_cfg,))
+
+  sim.forward()
+  sim.sense()
+  data = scene["test_cam"].data
+
+  assert isinstance(data, CameraSensorData)
+  assert data.segmentation is not None
+  assert data.segmentation.shape == (2, 24, 32, 2)
+  assert data.segmentation.dtype == torch.int32
+  assert data.rgb is None
+  assert data.depth is None
+
+
+def test_camera_segmentation_content(device):
+  """Segmentation contains typed MuJoCo ids for geom hits and background."""
+  cam_cfg = CameraSensorCfg(
+    name="test_cam",
+    camera_name="world/overhead_cam",
+    width=32,
+    height=24,
+    data_types=("segmentation",),
+  )
+  scene, sim = _make_scene_and_sim(device, sensors=(cam_cfg,))
+
+  sim.forward()
+  sim.sense()
+  seg = scene["test_cam"].data.segmentation
+  assert seg is not None
+
+  seg_np = seg.cpu().numpy()
+  obj_ids = seg_np[..., 0]
+  obj_types = seg_np[..., 1]
+
+  geom_mask = obj_types == int(mujoco.mjtObj.mjOBJ_GEOM)
+  background_mask = obj_types == -1
+
+  assert geom_mask.any(), "Expected at least one geom hit"
+  assert (obj_ids[geom_mask] >= 0).all()
+  assert len(set(obj_ids[geom_mask].flatten().tolist())) > 1
+  if background_mask.any():
+    assert (obj_ids[background_mask] == -1).all()
+
+
+def test_camera_rgb_depth_segmentation(device):
+  """All three data types can be requested simultaneously."""
+  cam_cfg = CameraSensorCfg(
+    name="test_cam",
+    camera_name="world/overhead_cam",
+    width=32,
+    height=24,
+    data_types=("rgb", "depth", "segmentation"),
+  )
+  scene, sim = _make_scene_and_sim(device, sensors=(cam_cfg,))
+
+  sim.forward()
+  sim.sense()
+  data = scene["test_cam"].data
+
+  assert data.rgb is not None
+  assert data.depth is not None
+  assert data.segmentation is not None
+  assert data.rgb.shape == (2, 24, 32, 3)
+  assert data.depth.shape == (2, 24, 32, 1)
+  assert data.segmentation.shape == (2, 24, 32, 2)
+
+
 def test_camera_create_on_parent_body(device):
   """Camera sensor can create a new camera attached to a body."""
   xml = """

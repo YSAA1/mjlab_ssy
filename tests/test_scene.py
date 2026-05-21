@@ -191,6 +191,29 @@ def test_write_zip(minimal_scene_cfg, tmp_path, device):
   assert out.with_suffix(".zip").exists()
 
 
+def test_write_skips_unreferenced_assets(minimal_scene_cfg, tmp_path, device):
+  """write() only includes assets referenced in the generated XML."""
+  scene = Scene(minimal_scene_cfg, device)
+  scene._spec.assets["unused_mesh.stl"] = b"fake"
+  out = tmp_path / "out"
+  scene.write(out)
+  assert (out / "scene.xml").exists()
+  assets_dir = out / "assets"
+  asset_files = list(assets_dir.rglob("*")) if assets_dir.exists() else []
+  assert not any(f.is_file() for f in asset_files)
+
+
+def test_write_no_traversal_escape(minimal_scene_cfg, tmp_path, device):
+  """Asset keys with path traversal must not escape the output directory."""
+  scene = Scene(minimal_scene_cfg, device)
+  scene._spec.assets["../../assets/robot/mesh.stl"] = b"fake"
+  out = tmp_path / "subdir" / "out"
+  scene.write(out)
+  for f in tmp_path.rglob("*"):
+    if f.is_file() and f.name != "scene.xml":
+      assert str(f).startswith(str(out)), f"File escaped output dir: {f}"
+
+
 # ============================================================================
 # Entity Access Tests
 # ============================================================================
@@ -545,3 +568,30 @@ def test_two_actuated_entities_write_ctrl(device):
 
   # Controls should differ since targets differ.
   assert not torch.allclose(ctrl_a, ctrl_b)
+
+
+def test_entity_with_option_flags_warns(device):
+  """Entity XML <option> flags are not propagated by MjSpec.attach()."""
+  xml_with_option = """
+    <mujoco>
+      <option>
+        <flag contact="disable" />
+      </option>
+      <worldbody>
+        <body name="box" pos="0 0 0.5">
+          <freejoint name="free"/>
+          <geom name="box_geom" type="box" size="0.1 0.1 0.1" mass="1.0"/>
+        </body>
+      </worldbody>
+    </mujoco>
+  """
+  cfg = SceneCfg(
+    num_envs=1,
+    entities={
+      "box": EntityCfg(
+        spec_fn=lambda: mujoco.MjSpec.from_string(xml_with_option),
+      ),
+    },
+  )
+  with pytest.warns(UserWarning, match="disableflags"):
+    Scene(cfg, device)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import TYPE_CHECKING, Callable, Sequence
 
 import mujoco
 import mujoco_warp as mjwarp
@@ -13,7 +13,6 @@ import torch
 from mjlab import actuator
 from mjlab.actuator import BuiltinActuatorGroup
 from mjlab.actuator.actuator import TransmissionType
-from mjlab.actuator.delayed_builtin_group import DelayedBuiltinActuatorGroup
 from mjlab.actuator.xml_actuator import XmlActuator
 from mjlab.entity.data import EntityData
 from mjlab.utils import spec_config as spec_cfg
@@ -22,6 +21,9 @@ from mjlab.utils.mujoco import dof_width, qpos_width
 from mjlab.utils.spec import auto_wrap_fixed_base_mocap
 from mjlab.utils.string import resolve_expr
 from mjlab.utils.xml import fix_spec_xml, strip_buffer_textures
+
+if TYPE_CHECKING:
+  from mjlab.entity.variants import VariantMetadata
 
 
 @dataclass(frozen=False)
@@ -37,6 +39,7 @@ class EntityIndexing:
   cameras: tuple[mujoco.MjsCamera, ...]
   lights: tuple[mujoco.MjsLight, ...]
   materials: tuple[mujoco.MjsMaterial, ...]
+  pairs: tuple[mujoco.MjsPair, ...]
   actuators: tuple[mujoco.MjsActuator, ...] | None
 
   # Indices.
@@ -47,6 +50,7 @@ class EntityIndexing:
   cam_ids: torch.Tensor
   light_ids: torch.Tensor
   mat_ids: torch.Tensor
+  pair_ids: torch.Tensor
   ctrl_ids: torch.Tensor
   joint_ids: torch.Tensor
   mocap_id: int | None
@@ -142,6 +146,7 @@ class Entity:
   def __init__(self, cfg: EntityCfg) -> None:
     self.cfg = cfg
     self._actuators: list[actuator.Actuator] = []
+    self._variant_metadata: VariantMetadata | None = None
     self._build_spec()
     self._identify_joints()
     self._apply_spec_editors()
@@ -149,7 +154,16 @@ class Entity:
     self._add_initial_state_keyframe()
 
   def _build_spec(self) -> None:
-    self._spec = auto_wrap_fixed_base_mocap(self.cfg.spec_fn)()
+    from mjlab.entity.variants import VariantEntityCfg, build_merged_variant_spec
+
+    if isinstance(self.cfg, VariantEntityCfg):
+      self._spec, self._variant_metadata = build_merged_variant_spec(self.cfg)
+    else:
+      self._spec = auto_wrap_fixed_base_mocap(self.cfg.spec_fn)()
+
+  @property
+  def variant_metadata(self) -> VariantMetadata | None:
+    return self._variant_metadata
 
   def _identify_joints(self) -> None:
     self._all_joints = self._spec.joints
@@ -179,27 +193,75 @@ class Entity:
     # Collect actuator instances and their targets.
     pending: list[tuple[actuator.ActuatorCfg, actuator.Actuator, list[str]]] = []
     for actuator_cfg in self.cfg.articulation.actuators:
-      # Find targets based on transmission type.
-      if actuator_cfg.transmission_type == TransmissionType.JOINT:
-        target_ids, target_names = self.find_joints(actuator_cfg.target_names_expr)
-        target_spec_names = [self._non_free_joints[i].name for i in target_ids]
-      elif actuator_cfg.transmission_type == TransmissionType.TENDON:
-        target_ids, target_names = self.find_tendons(actuator_cfg.target_names_expr)
-        target_spec_names = [self._spec.tendons[i].name for i in target_ids]
-      elif actuator_cfg.transmission_type == TransmissionType.SITE:
-        target_ids, target_names = self.find_sites(actuator_cfg.target_names_expr)
-        target_spec_names = [self.spec.sites[i].name for i in target_ids]
-      else:
-        raise ValueError(
-          f"Invalid transmission_type: {actuator_cfg.transmission_type}. "
-          f"Must be TransmissionType.JOINT, TransmissionType.TENDON, or TransmissionType.SITE."
-        )
+      # Find targets based on transmission type. resolve_matching_names raises
+      # ValueError when no regex matches; we catch that to produce a better error with
+      # namespace hints below.
+      target_ids: list[int] = []
+      target_names: list[str] = []
+      target_spec_names: list[str] = []
+      try:
+        if actuator_cfg.transmission_type == TransmissionType.JOINT:
+          target_ids, target_names = self.find_joints(actuator_cfg.target_names_expr)
+          target_spec_names = [self._non_free_joints[i].name for i in target_ids]
+        elif actuator_cfg.transmission_type == TransmissionType.TENDON:
+          target_ids, target_names = self.find_tendons(actuator_cfg.target_names_expr)
+          target_spec_names = [self._spec.tendons[i].name for i in target_ids]
+        elif actuator_cfg.transmission_type == TransmissionType.SITE:
+          target_ids, target_names = self.find_sites(actuator_cfg.target_names_expr)
+          target_spec_names = [self.spec.sites[i].name for i in target_ids]
+        else:
+          raise TypeError(
+            f"Invalid transmission_type: {actuator_cfg.transmission_type}. "
+            f"Must be TransmissionType.JOINT, TransmissionType.TENDON, "
+            f"or TransmissionType.SITE."
+          )
+      except ValueError:
+        pass  # target_names stays empty, fall through to hint logic
+
+      # Check other namespaces for matches. If we found nothing, this produces a
+      # helpful error. If we did find targets, it warns about unactuated matches in
+      # other namespaces.
+      current = actuator_cfg.transmission_type
+      other_matches: dict[TransmissionType, tuple[str, list[str]]] = {}
+      other_namespaces = {
+        TransmissionType.JOINT: ("joint", self.joint_names),
+        TransmissionType.TENDON: ("tendon", self.tendon_names),
+        TransmissionType.SITE: ("site", self.site_names),
+      }
+      for tt, (label, names) in other_namespaces.items():
+        if tt == current or not names:
+          continue
+        try:
+          _, matched = resolve_matching_names(actuator_cfg.target_names_expr, names)
+          other_matches[tt] = (label, matched)
+        except ValueError:
+          pass
 
       if len(target_names) == 0:
-        raise ValueError(
-          f"No {actuator_cfg.transmission_type}s found for actuator with "
-          f"expressions: {actuator_cfg.target_names_expr}"
+        msg = (
+          f"No {current.value}s matched expressions: {actuator_cfg.target_names_expr}"
         )
+        if other_matches:
+          hints = [
+            f"{label}s ({', '.join(matched)})"
+            for label, matched in other_matches.values()
+          ]
+          msg += (
+            f". Matches were found in: {'; '.join(hints)}. "
+            f"Check that transmission_type is correct."
+          )
+        raise ValueError(msg)
+
+      for tt, (label, matched) in other_matches.items():
+        warnings.warn(
+          f"Actuator config matched {len(target_names)} {current.value}(s) "
+          f"but the same expressions also match {len(matched)} {label}(s): "
+          f"{', '.join(matched)}. Add a separate config with "
+          f"transmission_type=TransmissionType.{tt.name} if those should "
+          f"be actuated too.",
+          stacklevel=2,
+        )
+
       actuator_instance = actuator_cfg.build(self, target_ids, target_names)
       self._actuators.append(actuator_instance)
       pending.append((actuator_cfg, actuator_instance, target_spec_names))
@@ -380,6 +442,10 @@ class Entity:
     return tuple(m.name.split("/")[-1] for m in self.spec.materials)
 
   @property
+  def pair_names(self) -> tuple[str, ...]:
+    return tuple(p.name.split("/")[-1] for p in self.spec.pairs)
+
+  @property
   def actuator_names(self) -> tuple[str, ...]:
     return tuple(a.name.split("/")[-1] for a in self.spec.actuators)
 
@@ -416,6 +482,10 @@ class Entity:
   @property
   def num_materials(self) -> int:
     return len(self.material_names)
+
+  @property
+  def num_pairs(self) -> int:
+    return len(self.pair_names)
 
   @property
   def num_actuators(self) -> int:
@@ -526,6 +596,16 @@ class Entity:
       material_subset = self.material_names
     return resolve_matching_names(name_keys, material_subset, preserve_order)
 
+  def find_pairs(
+    self,
+    name_keys: str | Sequence[str],
+    pair_subset: Sequence[str] | None = None,
+    preserve_order: bool = False,
+  ) -> tuple[list[int], list[str]]:
+    if pair_subset is None:
+      pair_subset = self.pair_names
+    return resolve_matching_names(name_keys, pair_subset, preserve_order)
+
   def find_actuators(
     self,
     name_keys: str | Sequence[str],
@@ -576,25 +656,12 @@ class Entity:
 
     # Vectorize built-in actuators; we'll loop through custom ones.
     builtin_group, custom_actuators = BuiltinActuatorGroup.process(self._actuators)
-    delayed_builtin_group, custom_actuators = DelayedBuiltinActuatorGroup.process(
-      custom_actuators
-    )
-    delayed_builtin_group.initialize(nworld, device)
+    builtin_group.initialize(nworld, device)
     self._builtin_group = builtin_group
-    self._delayed_builtin_group = delayed_builtin_group
     self._custom_actuators = custom_actuators
 
     # Root state.
-    root_state_components = [self.cfg.init_state.pos, self.cfg.init_state.rot]
-    if not self.is_fixed_base:
-      root_state_components.extend(
-        [self.cfg.init_state.lin_vel, self.cfg.init_state.ang_vel]
-      )
-    default_root_state = torch.tensor(
-      sum((tuple(c) for c in root_state_components), ()),
-      dtype=torch.float,
-      device=device,
-    ).repeat(nworld, 1)
+    default_root_state = self._build_default_root_state(nworld, device)
 
     # Joint state.
     if self.is_articulated:
@@ -1087,6 +1154,18 @@ class Entity:
   # Private methods.
   ##
 
+  def _build_default_root_state(self, nworld: int, device: str) -> torch.Tensor:
+    """Build default root state tensor, uniform across all worlds."""
+    base = self.cfg.init_state
+    components: list[tuple[float, ...]] = [base.pos, base.rot]
+    if not self.is_fixed_base:
+      components.extend([base.lin_vel, base.ang_vel])
+    return torch.tensor(
+      sum((tuple(c) for c in components), ()),
+      dtype=torch.float,
+      device=device,
+    ).repeat(nworld, 1)
+
   def _compute_indexing(self, model: mujoco.MjModel, device: str) -> EntityIndexing:
     bodies = tuple([b for b in self.spec.bodies[1:]])
     joints = self._non_free_joints
@@ -1096,6 +1175,7 @@ class Entity:
     cameras = tuple(self.spec.cameras)
     lights = tuple(self.spec.lights)
     materials = tuple(self.spec.materials)
+    pairs = tuple(self.spec.pairs)
 
     body_ids = torch.tensor([b.id for b in bodies], dtype=torch.int, device=device)
     geom_ids = torch.tensor([g.id for g in geoms], dtype=torch.int, device=device)
@@ -1104,6 +1184,7 @@ class Entity:
     cam_ids = torch.tensor([c.id for c in cameras], dtype=torch.int, device=device)
     light_ids = torch.tensor([lt.id for lt in lights], dtype=torch.int, device=device)
     mat_ids = torch.tensor([m.id for m in materials], dtype=torch.int, device=device)
+    pair_ids = torch.tensor([p.id for p in pairs], dtype=torch.int, device=device)
     joint_ids = torch.tensor([j.id for j in joints], dtype=torch.int, device=device)
 
     if self.is_actuated:
@@ -1147,6 +1228,7 @@ class Entity:
       cameras=cameras,
       lights=lights,
       materials=materials,
+      pairs=pairs,
       actuators=actuators,
       body_ids=body_ids,
       geom_ids=geom_ids,
@@ -1155,6 +1237,7 @@ class Entity:
       cam_ids=cam_ids,
       light_ids=light_ids,
       mat_ids=mat_ids,
+      pair_ids=pair_ids,
       ctrl_ids=ctrl_ids,
       joint_ids=joint_ids,
       mocap_id=mocap_id,
@@ -1166,7 +1249,7 @@ class Entity:
 
   def _apply_actuator_controls(self) -> None:
     self._builtin_group.apply_controls(self._data)
-    self._delayed_builtin_group.apply_controls(self._data)
     for act in self._custom_actuators:
       command = act.get_command(self._data)
+      command = act.apply_delay(command)
       self._data.write_ctrl(act.compute(command), act.ctrl_ids)
