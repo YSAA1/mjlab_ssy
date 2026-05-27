@@ -43,6 +43,8 @@ class TrainConfig:
   wandb_run_path: str | None = None
   wandb_checkpoint_name: str | None = None
   """Optional checkpoint name within the W&B run to load (e.g. 'model_4000.pt')."""
+  checkpoint_file: str | None = None
+  """Optional explicit local checkpoint path to load when resuming."""
   gpu_ids: list[int] | Literal["all"] | None = field(default_factory=lambda: [0])
 
   @staticmethod
@@ -120,8 +122,15 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
   log_root_path = log_dir.parent  # Go up from specific run dir to experiment dir.
 
   resume_path: Path | None = None
+  if cfg.checkpoint_file is not None and not cfg.agent.resume:
+    raise ValueError("--checkpoint-file requires --agent.resume True")
+
   if cfg.agent.resume:
-    if cfg.wandb_run_path is not None:
+    if cfg.checkpoint_file is not None:
+      resume_path = Path(cfg.checkpoint_file).expanduser().resolve()
+      if not resume_path.is_file():
+        raise FileNotFoundError(f"Checkpoint file not found: {resume_path}")
+    elif cfg.wandb_run_path is not None:
       # Load checkpoint from W&B.
       resume_path, was_cached = get_wandb_checkpoint_path(
         log_root_path, Path(cfg.wandb_run_path), cfg.wandb_checkpoint_name

@@ -83,6 +83,8 @@ Table of Contents
    source/training/cloud
    source/debugging/nan_guard
    source/debugging/export_scene
+   source/debugging/g1_unitree_sim2sim
+   source/debugging/g1_tracking_phase1
 
 .. toctree::
    :maxdepth: 2

@@ -85,6 +85,29 @@ def motion_relative_body_height_error_exp(
   return torch.exp(-error.mean(-1) / std**2)
 
 
+def motion_relative_body_height_above_error_exp(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  std: float,
+  min_reference_height: float,
+  body_names: tuple[str, ...] | None = None,
+) -> torch.Tensor:
+  command = cast(MotionCommand, env.command_manager.get_term(command_name))
+  body_indexes = _get_body_indexes(command, body_names)
+  if not body_indexes:
+    return torch.zeros(command.num_envs, device=command.device)
+
+  reference_height = command.body_pos_relative_w[:, body_indexes, -1]
+  robot_height = command.robot_body_pos_w[:, body_indexes, -1]
+  active = reference_height >= min_reference_height
+  per_body_reward = torch.exp(-torch.square(reference_height - robot_height) / std**2)
+  weighted_reward = torch.where(
+    active, per_body_reward, torch.zeros_like(per_body_reward)
+  )
+  active_count = active.float().sum(dim=-1)
+  return weighted_reward.sum(dim=-1) / active_count.clamp(min=1.0)
+
+
 def motion_relative_body_orientation_error_exp(
   env: ManagerBasedRlEnv,
   command_name: str,

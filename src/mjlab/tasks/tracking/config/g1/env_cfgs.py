@@ -7,7 +7,9 @@ from mjlab.asset_zoo.robots import (
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg
+from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
+from mjlab.tasks.tracking import mdp
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.tasks.tracking.tracking_env_cfg import make_tracking_env_cfg
 
@@ -154,5 +156,42 @@ def unitree_g1_flat_acrobatics_env_cfg(
   if not play:
     cfg.episode_length_s = 15.0
     cfg.sim.nconmax = 80
+
+  return cfg
+
+
+def unitree_g1_flat_roundhouse_leading_right_env_cfg(
+  has_state_estimation: bool = True,
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """Create a G1 tracking config with extra right-leg apex rewards."""
+  cfg = unitree_g1_flat_acrobatics_env_cfg(
+    has_state_estimation=has_state_estimation,
+    play=play,
+  )
+
+  cfg.rewards["roundhouse_right_leg_pos"] = RewardTermCfg(
+    func=mdp.motion_relative_body_position_error_exp,
+    weight=1.0,
+    params={
+      "command_name": "motion",
+      "std": 0.22,
+      "body_names": (
+        "right_hip_roll_link",
+        "right_knee_link",
+        "right_ankle_roll_link",
+      ),
+    },
+  )
+  cfg.rewards["roundhouse_right_ankle_apex_height"] = RewardTermCfg(
+    func=mdp.motion_relative_body_height_above_error_exp,
+    weight=3.0,
+    params={
+      "command_name": "motion",
+      "std": 0.55,
+      "min_reference_height": 0.75,
+      "body_names": ("right_ankle_roll_link",),
+    },
+  )
 
   return cfg

@@ -12,6 +12,7 @@ from mjlab.tasks.tracking.mdp.metrics import (
 )
 from mjlab.tasks.tracking.mdp.rewards import (
   motion_global_anchor_planar_position_error_exp,
+  motion_relative_body_height_above_error_exp,
   motion_relative_body_height_error_exp,
 )
 from mjlab.tasks.tracking.mdp.terminations import (
@@ -123,3 +124,28 @@ def test_env_contract_control_rewards_provide_smooth_planar_and_height_signals()
 
   assert torch.allclose(planar_reward, expected_planar)
   assert torch.allclose(height_reward, expected_height)
+
+
+def test_height_above_reward_only_scores_reference_apex_window() -> None:
+  env: Any = _FakeEnv(_make_command())
+
+  foot_reward = motion_relative_body_height_above_error_exp(
+    env,
+    "motion",
+    std=2.0,
+    min_reference_height=4.0,
+    body_names=("foot",),
+  )
+  hand_reward = motion_relative_body_height_above_error_exp(
+    env,
+    "motion",
+    std=2.0,
+    min_reference_height=4.0,
+    body_names=("hand",),
+  )
+
+  expected_foot = torch.exp(-torch.tensor([16.0 / 4.0, 2.25 / 4.0]))
+  expected_hand = torch.tensor([0.0, torch.exp(torch.tensor(-36.0 / 4.0))])
+
+  assert torch.allclose(foot_reward, expected_foot)
+  assert torch.allclose(hand_reward, expected_hand)

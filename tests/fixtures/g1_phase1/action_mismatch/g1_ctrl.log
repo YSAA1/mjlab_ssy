@@ -1,0 +1,11 @@
+[2026-05-22 12:00:00.000] [info] FSM: Start Velocity
+[2026-05-22 12:00:01.000] [info] [PHASE1] event=trigger action=flying_kick command=enter
+[2026-05-22 12:00:01.000] [info] FSM: Change state from Velocity to Mimic_FlyingKick
+[2026-05-22 12:00:01.020] [info] [PHASE1] event=motion_frame action=flying_kick frame=0 motion_t=0.00
+[2026-05-22 12:00:01.040] [info] [PHASE1] event=policy_step action=flying_kick step=1
+[2026-05-22 12:00:01.060] [info] [PHASE1] event=lowcmd_write action=flying_kick step=1
+[2026-05-22 12:00:01.080] [info] [PHASE1] event=q_response action=flying_kick step=1 q_err_l2=8.20 dq_err_l2=150.00 base_vel_x=0.00 command_vel_x=0.00 gravity_b=(0.900,0.100,0.200)
+[2026-05-22 12:00:04.000] [info] FSM: Change state from Mimic_FlyingKick to Velocity
+[2026-05-22 12:00:04.500] [info] [PHASE1] event=stable_sample state=Velocity stable=1 q_err_l2=0.10 base_vel_x=0.00 command_vel_x=0.00 gravity_b=(0.000,0.000,-1.000)
+[2026-05-22 12:00:07.000] [info] [PHASE1] event=stable_sample state=Velocity stable=1 q_err_l2=0.09 base_vel_x=0.00 command_vel_x=0.00 gravity_b=(0.000,0.000,-1.000)
+[2026-05-22 12:00:09.500] [info] [PHASE1] event=stable_sample state=Velocity stable=1 q_err_l2=0.08 base_vel_x=0.00 command_vel_x=0.00 gravity_b=(0.000,0.000,-1.000)

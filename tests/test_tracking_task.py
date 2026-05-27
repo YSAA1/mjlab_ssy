@@ -53,6 +53,7 @@ def test_tracking_no_state_estimation_observations() -> None:
   task_ids = [
     "Mjlab-Tracking-Flat-Unitree-G1-No-State-Estimation",
     "Mjlab-Tracking-Flat-Unitree-G1-Acrobatics-No-State-Estimation",
+    "Mjlab-Tracking-Flat-Unitree-G1-RoundhouseLeadingRight-No-State-Estimation",
   ]
 
   for task_id in task_ids:
@@ -82,6 +83,7 @@ def test_tracking_play_disables_rsi_randomization() -> None:
     "Mjlab-Tracking-Flat-Unitree-G1",
     "Mjlab-Tracking-Flat-Unitree-G1-No-State-Estimation",
     "Mjlab-Tracking-Flat-Unitree-G1-Acrobatics-No-State-Estimation",
+    "Mjlab-Tracking-Flat-Unitree-G1-RoundhouseLeadingRight-No-State-Estimation",
   ]
 
   for task_id in tracking_tasks:
@@ -108,6 +110,7 @@ def test_tracking_play_uses_start_sampling_mode() -> None:
     "Mjlab-Tracking-Flat-Unitree-G1",
     "Mjlab-Tracking-Flat-Unitree-G1-No-State-Estimation",
     "Mjlab-Tracking-Flat-Unitree-G1-Acrobatics-No-State-Estimation",
+    "Mjlab-Tracking-Flat-Unitree-G1-RoundhouseLeadingRight-No-State-Estimation",
   ]
 
   for task_id in tracking_tasks:
@@ -348,5 +351,45 @@ def test_acrobatics_no_state_estimation_rl_cfg_uses_separate_experiment() -> Non
 
   assert cfg.experiment_name == "g1_tracking_acrobatics_no_state"
   assert cfg.max_iterations == 40_000
+  assert cfg.num_steps_per_env == 32
+  assert cfg.algorithm.learning_rate == 5.0e-4
+
+
+def test_roundhouse_leading_right_no_state_task_is_registered() -> None:
+  """The deploy-friendly roundhouse tracking task should be registered."""
+  task_id = "Mjlab-Tracking-Flat-Unitree-G1-RoundhouseLeadingRight-No-State-Estimation"
+
+  assert task_id in list_tasks(), f"Task {task_id} is not registered"
+
+
+def test_roundhouse_leading_right_rewards_are_task_local() -> None:
+  """Roundhouse apex rewards should not alter the generic acrobatics task."""
+  acrobatics_task_id = "Mjlab-Tracking-Flat-Unitree-G1-Acrobatics-No-State-Estimation"
+  roundhouse_task_id = (
+    "Mjlab-Tracking-Flat-Unitree-G1-RoundhouseLeadingRight-No-State-Estimation"
+  )
+
+  acrobatics_cfg = load_env_cfg(acrobatics_task_id)
+  roundhouse_cfg = load_env_cfg(roundhouse_task_id)
+
+  assert "roundhouse_right_leg_pos" not in acrobatics_cfg.rewards
+  assert "roundhouse_right_ankle_apex_height" not in acrobatics_cfg.rewards
+  assert "roundhouse_right_leg_pos" in roundhouse_cfg.rewards
+  assert "roundhouse_right_ankle_apex_height" in roundhouse_cfg.rewards
+
+  apex_reward = roundhouse_cfg.rewards["roundhouse_right_ankle_apex_height"]
+  assert apex_reward.weight == 3.0
+  assert apex_reward.params["std"] == 0.55
+  assert apex_reward.params["body_names"] == ("right_ankle_roll_link",)
+  assert apex_reward.params["min_reference_height"] == 0.75
+
+
+def test_roundhouse_leading_right_rl_cfg_uses_separate_experiment() -> None:
+  """Roundhouse finetunes should not write into generic acrobatics logs."""
+  task_id = "Mjlab-Tracking-Flat-Unitree-G1-RoundhouseLeadingRight-No-State-Estimation"
+  cfg = load_rl_cfg(task_id)
+
+  assert cfg.experiment_name == "g1_tracking_roundhouse_leading_right_no_state"
+  assert cfg.max_iterations == 5000
   assert cfg.num_steps_per_env == 32
   assert cfg.algorithm.learning_rate == 5.0e-4

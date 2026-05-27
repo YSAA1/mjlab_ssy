@@ -8,7 +8,9 @@ from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.event_manager import EventTermCfg
+from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import (
   ContactMatch,
   ContactSensorCfg,
@@ -216,5 +218,83 @@ def unitree_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     assert isinstance(twist_cmd, UniformVelocityCommandCfg)
     twist_cmd.ranges.lin_vel_x = (-1.5, 2.0)
     twist_cmd.ranges.ang_vel_z = (-0.7, 0.7)
+
+  return cfg
+
+
+def unitree_g1_flat_deploy98_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """Create a flat G1 Velocity config matching the 98-dim Unitree deploy runtime."""
+  cfg = unitree_g1_flat_env_cfg(play=play)
+
+  actor_terms = cfg.observations["actor"].terms
+  cfg.observations["actor"].terms = {
+    "base_ang_vel": actor_terms["base_ang_vel"],
+    "projected_gravity": actor_terms["projected_gravity"],
+    "command": actor_terms["command"],
+    "phase": ObservationTermCfg(
+      func=mdp.phase,
+      params={"period": 0.6, "command_name": "twist"},
+    ),
+    "joint_pos": actor_terms["joint_pos"],
+    "joint_vel": actor_terms["joint_vel"],
+    "actions": actor_terms["actions"],
+  }
+
+  return cfg
+
+
+def unitree_g1_flat_deploy98_stand_first_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """Create a deploy98 G1 Velocity config focused on zero-command standing."""
+  cfg = unitree_g1_flat_deploy98_env_cfg(play=play)
+
+  twist_cmd = cfg.commands["twist"]
+  assert isinstance(twist_cmd, UniformVelocityCommandCfg)
+  twist_cmd.rel_standing_envs = 1.0
+  twist_cmd.rel_heading_envs = 0.0
+  twist_cmd.rel_forward_envs = 0.0
+  twist_cmd.rel_world_envs = 0.0
+  twist_cmd.init_velocity_prob = 0.0
+  twist_cmd.heading_command = False
+  twist_cmd.ranges.lin_vel_x = (0.0, 0.0)
+  twist_cmd.ranges.lin_vel_y = (0.0, 0.0)
+  twist_cmd.ranges.ang_vel_z = (0.0, 0.0)
+  twist_cmd.ranges.heading = None
+  twist_cmd.resampling_time_range = (5.0, 5.0)
+
+  cfg.events.pop("push_robot", None)
+  cfg.curriculum.pop("command_vel", None)
+
+  cfg.rewards["alive"] = RewardTermCfg(func=envs_mdp.is_alive, weight=1.0)
+  cfg.rewards["termination_penalty"] = RewardTermCfg(
+    func=envs_mdp.is_terminated,
+    weight=-20.0,
+  )
+
+  if not play:
+    cfg.episode_length_s = 5.0
+
+  return cfg
+
+
+def unitree_g1_flat_deploy98_stand_first_damped_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """Create a zero-command deploy98 G1 Velocity config with stronger damping costs."""
+  cfg = unitree_g1_flat_deploy98_stand_first_env_cfg(play=play)
+
+  cfg.rewards["pose"].weight = 2.0
+  cfg.rewards["body_ang_vel"].weight = -0.2
+  cfg.rewards["action_rate_l2"].weight = -0.5
+  cfg.rewards["action_acc_l2"] = RewardTermCfg(
+    func=envs_mdp.action_acc_l2,
+    weight=-0.25,
+  )
+  cfg.rewards["joint_vel_l2"] = RewardTermCfg(
+    func=envs_mdp.joint_vel_l2,
+    weight=-0.02,
+    params={"asset_cfg": SceneEntityCfg("robot", joint_names=(".*",))},
+  )
 
   return cfg

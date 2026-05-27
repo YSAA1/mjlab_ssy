@@ -70,6 +70,7 @@ build-tracking-motion = "mjlab.scripts.build_tracking_motion:main"
 report-and-preview-motion = "mjlab.scripts.report_and_preview_motion:cli"
 evaluate-tracking = "mjlab.scripts.evaluate_tracking:main"
 flashsac-lane0-manifest = "mjlab.scripts.flashsac_lane0_manifest:main"
+unitree-sim2sim = "mjlab.sim2sim.unitree.cli:main"
 
 [dependency-groups]
 dev = [

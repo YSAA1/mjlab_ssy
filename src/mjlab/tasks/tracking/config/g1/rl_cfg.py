@@ -73,3 +73,13 @@ def unitree_g1_tracking_acrobatics_no_state_runner_cfg() -> RslRlOnPolicyRunnerC
   cfg = unitree_g1_tracking_acrobatics_finetune_runner_cfg()
   cfg.experiment_name = "g1_tracking_acrobatics_no_state"
   return cfg
+
+
+def unitree_g1_tracking_roundhouse_leading_right_no_state_runner_cfg() -> (
+  RslRlOnPolicyRunnerCfg
+):
+  """Create a deploy-friendly runner for the leading-right roundhouse kick."""
+  cfg = unitree_g1_tracking_acrobatics_no_state_runner_cfg()
+  cfg.experiment_name = "g1_tracking_roundhouse_leading_right_no_state"
+  cfg.max_iterations = 5000
+  return cfg

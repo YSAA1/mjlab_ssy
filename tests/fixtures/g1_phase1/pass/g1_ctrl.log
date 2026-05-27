@@ -1,0 +1,21 @@
+[2026-05-22 10:00:00.000] [info] FSM: Start Velocity
+[2026-05-22 10:00:01.000] [info] [PHASE1] event=trigger action=flying_kick command=RB+X
+[2026-05-22 10:00:01.080] [info] FSM: Change state from Velocity to Mimic_FlyingKick
+[2026-05-22 10:00:01.100] [info] [PHASE1] event=motion_frame action=flying_kick frame=0 motion_t=0.00
+[2026-05-22 10:00:01.120] [info] [PHASE1] event=policy_step action=flying_kick step=0
+[2026-05-22 10:00:01.140] [info] [PHASE1] event=lowcmd_write action=flying_kick step=0
+[2026-05-22 10:00:01.160] [info] [PHASE1] event=q_response action=flying_kick q_err_l2=0.20 dq_err_l2=0.30 base_vel_x=0.00 command_vel_x=0.00 gravity_b=(0.000,0.000,-1.000)
+[2026-05-22 10:00:04.420] [info] FSM: Change state from Mimic_FlyingKick to Velocity
+[2026-05-22 10:00:04.700] [info] [PHASE1] event=stable_sample state=Velocity stable=1 q_err_l2=0.10 base_vel_x=0.00 command_vel_x=0.00 gravity_b=(0.000,0.000,-1.000)
+[2026-05-22 10:00:07.000] [info] [PHASE1] event=stable_sample state=Velocity stable=1 q_err_l2=0.09 base_vel_x=0.00 command_vel_x=0.00 gravity_b=(0.000,0.000,-1.000)
+[2026-05-22 10:00:09.600] [info] [PHASE1] event=stable_sample state=Velocity stable=1 q_err_l2=0.08 base_vel_x=0.00 command_vel_x=0.00 gravity_b=(0.000,0.000,-1.000)
+[2026-05-22 10:00:20.000] [info] [PHASE1] event=trigger action=roundhouse_leading_right command=RB+Y
+[2026-05-22 10:00:20.070] [info] FSM: Change state from Velocity to Mimic_RoundhouseLeadingRight
+[2026-05-22 10:00:20.090] [info] [PHASE1] event=motion_frame action=roundhouse_leading_right frame=0 motion_t=0.00
+[2026-05-22 10:00:20.110] [info] [PHASE1] event=policy_step action=roundhouse_leading_right step=0
+[2026-05-22 10:00:20.130] [info] [PHASE1] event=lowcmd_write action=roundhouse_leading_right step=0
+[2026-05-22 10:00:20.150] [info] [PHASE1] event=q_response action=roundhouse_leading_right q_err_l2=0.24 dq_err_l2=0.33 base_vel_x=0.00 command_vel_x=0.00 gravity_b=(0.000,0.000,-1.000)
+[2026-05-22 10:00:24.100] [info] FSM: Change state from Mimic_RoundhouseLeadingRight to Velocity
+[2026-05-22 10:00:24.400] [info] [PHASE1] event=stable_sample state=Velocity stable=1 q_err_l2=0.12 base_vel_x=0.00 command_vel_x=0.00 gravity_b=(0.000,0.000,-1.000)
+[2026-05-22 10:00:27.100] [info] [PHASE1] event=stable_sample state=Velocity stable=1 q_err_l2=0.11 base_vel_x=0.00 command_vel_x=0.00 gravity_b=(0.000,0.000,-1.000)
+[2026-05-22 10:00:29.400] [info] [PHASE1] event=stable_sample state=Velocity stable=1 q_err_l2=0.10 base_vel_x=0.00 command_vel_x=0.00 gravity_b=(0.000,0.000,-1.000)

@@ -1,0 +1,5 @@
+[2026-05-22 11:00:00.000] [info] FSM: Start Velocity
+[2026-05-22 11:00:01.000] [info] FSM: Change state from Velocity to Mimic_FlyingKick
+[2026-05-22 11:00:01.500] [info] [GETUP-DIAG] t=0.50 q_err_l2=0.433 q_err_max=0.218 q_target_err_l2=1.141 q_target_err_max=0.612 dq_err_l2=3.375 action_min=-1.040 action_max=0.556 gravity_b=(-0.143,0.032,-0.989)
+[2026-05-22 11:00:02.000] [info] [GETUP-DIAG] t=1.00 q_err_l2=0.614 q_err_max=0.281 q_target_err_l2=2.416 q_target_err_max=1.115 dq_err_l2=5.217 action_min=-1.823 action_max=1.074 gravity_b=(0.046,0.070,-0.996)
+[2026-05-22 11:00:04.400] [info] FSM: Change state from Mimic_FlyingKick to Velocity

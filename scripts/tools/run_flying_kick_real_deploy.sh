@@ -42,6 +42,7 @@ Before prepare/start, export the latest trained actor with:
 Real-robot FSM:
   Passive -> [X] -> Velocity
   Passive -> [A] -> Mimic_Getup -> Velocity
+  Velocity -> [B] -> Passive
   Velocity -> [RB + X] -> Mimic_FlyingKick
   Mimic_FlyingKick -> [B] -> Passive
   Mimic_FlyingKick -> [RB + B] -> Velocity
@@ -148,7 +149,7 @@ fixstand_transitions["Velocity"] = "RT + A.on_pressed"
 
 velocity = fsm.setdefault("Velocity", {})
 velocity_transitions = velocity.setdefault("transitions", {})
-velocity_transitions["Passive"] = "LT + B.on_pressed"
+velocity_transitions["Passive"] = "B.on_pressed"
 velocity_transitions["Mimic_Getup"] = "RB + A.on_pressed"
 velocity_transitions["Mimic_FlyingKick"] = "RB + X.on_pressed"
 velocity["policy_dir"] = "config/policy/velocity"
@@ -219,7 +220,7 @@ start_ctrl() {
 }
 
 status() {
-  tmux ls 2>/dev/null | rg "$CTRL_SESSION" || true
+  tmux ls 2>/dev/null | grep -F "$CTRL_SESSION" || true
   pgrep -af 'unitree_mujoco|g1_ctrl' || true
   if [[ -f "$ACTIVE_CONFIG" ]]; then
     project_python - "$ACTIVE_CONFIG" <<'PY'
